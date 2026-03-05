@@ -7,12 +7,17 @@ edition = "2024"
 name = "safetensors_streaming"
 crate-type = ["cdylib"]
 
+[features]
+default = []
+cuda = ["sst-gpu/cuda"]
+
 [dependencies]
 pyo3 = { workspace = true }
 sst-core = { workspace = true }
 sst-fetch = { workspace = true }
 sst-buffer = { workspace = true }
 sst-types = { workspace = true }
+sst-gpu = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }

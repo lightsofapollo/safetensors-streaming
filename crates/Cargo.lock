@@ -781,6 +781,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cudarc"
+version = "0.16.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17200eb07e7d85a243aa1bf4569a7aa998385ba98d14833973a817a63cc86e92"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "der"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1590,6 +1599,16 @@ name = "libc"
 version = "0.2.182"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6800badb6cb2082ffd7b6a67e6125bb39f18782f793520caee8cb8846be06112"
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
 
 [[package]]
 name = "libredox"
@@ -2630,6 +2649,9 @@ dependencies = [
 name = "sst-gpu"
 version = "0.1.0"
 dependencies = [
+ "cudarc",
+ "sst-buffer",
+ "sst-types",
  "thiserror",
  "tracing",
 ]
@@ -2643,6 +2665,7 @@ dependencies = [
  "sst-buffer",
  "sst-core",
  "sst-fetch",
+ "sst-gpu",
  "sst-types",
  "thiserror",
  "tokio",

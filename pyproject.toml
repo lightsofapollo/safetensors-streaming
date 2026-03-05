@@ -12,3 +12,13 @@ requires-python = ">=3.10"
 manifest-path = "crates/sst-python/Cargo.toml"
 module-name = "safetensors_streaming"
 features = ["pyo3/extension-module"]
+
+# Build instructions:
+#
+# CPU wheel (safetensors-streaming):
+#   maturin build --release
+#
+# CUDA 12.x wheel (safetensors-streaming-cu12):
+#   maturin build --release --features cuda
+#   Requires CUDA toolkit 12.x on the build machine.
+#   The wheel should be renamed/published as safetensors-streaming-cu12.

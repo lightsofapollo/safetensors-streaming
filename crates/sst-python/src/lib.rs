@@ -10,6 +10,45 @@ use sst_core::types::{Header, TensorInfo};
 use sst_fetch::RangeFetcher;
 use sst_types::DType;
 
+/// Parsed device specification.
+#[derive(Debug, Clone)]
+enum DeviceSpec {
+    Cpu,
+    Cuda(usize),
+}
+
+impl DeviceSpec {
+    /// Return the PyTorch device string (e.g. "cpu", "cuda:0").
+    fn to_torch_string(&self) -> String {
+        match self {
+            DeviceSpec::Cpu => "cpu".to_string(),
+            DeviceSpec::Cuda(ordinal) => format!("cuda:{ordinal}"),
+        }
+    }
+}
+
+/// Parse a device string like "cpu", "cuda", "cuda:0", "cuda:3".
+fn parse_device(device: &str) -> Result<DeviceSpec, SstPythonError> {
+    let trimmed = device.trim();
+    if trimmed == "cpu" {
+        return Ok(DeviceSpec::Cpu);
+    }
+    if trimmed == "cuda" {
+        return Ok(DeviceSpec::Cuda(0));
+    }
+    if let Some(ordinal_str) = trimmed.strip_prefix("cuda:") {
+        let ordinal: usize = ordinal_str.parse().map_err(|_| {
+            SstPythonError::InvalidDevice(format!(
+                "invalid CUDA device ordinal: {ordinal_str:?}"
+            ))
+        })?;
+        return Ok(DeviceSpec::Cuda(ordinal));
+    }
+    Err(SstPythonError::InvalidDevice(format!(
+        "unsupported device: {trimmed:?} (expected \"cpu\", \"cuda\", or \"cuda:N\")"
+    )))
+}
+
 /// Errors from the Python bindings.
 #[derive(Debug, thiserror::Error)]
 enum SstPythonError {
@@ -25,8 +64,11 @@ enum SstPythonError {
     #[error("unsupported framework: {0} (only \"pt\" is supported)")]
     UnsupportedFramework(String),
 
-    #[error("unsupported device: {0} (only \"cpu\" is supported)")]
-    UnsupportedDevice(String),
+    #[error("{0}")]
+    InvalidDevice(String),
+
+    #[error("{0}")]
+    CudaNotCompiled(String),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -50,6 +92,41 @@ impl From<SstPythonError> for PyErr {
 impl From<std::convert::Infallible> for SstPythonError {
     fn from(e: std::convert::Infallible) -> Self {
         match e {}
+    }
+}
+
+/// Check that CUDA support is compiled when a CUDA device is requested.
+/// Returns Ok(()) for CPU devices, or for CUDA when the feature is enabled.
+/// Returns an error for CUDA when compiled without the cuda feature.
+fn require_cuda_compiled(spec: &DeviceSpec) -> Result<(), SstPythonError> {
+    match spec {
+        DeviceSpec::Cpu => Ok(()),
+        DeviceSpec::Cuda(_) => {
+            if cfg!(feature = "cuda") {
+                Ok(())
+            } else {
+                Err(SstPythonError::CudaNotCompiled(
+                    "CUDA support not compiled. Install safetensors-streaming-cu12 for GPU support."
+                        .to_string(),
+                ))
+            }
+        }
+    }
+}
+
+/// Move a PyTorch tensor to the specified device (no-op for CPU).
+fn tensor_to_device(
+    py: Python<'_>,
+    tensor: PyObject,
+    spec: &DeviceSpec,
+) -> PyResult<PyObject> {
+    match spec {
+        DeviceSpec::Cpu => Ok(tensor),
+        DeviceSpec::Cuda(_) => {
+            let device_str = spec.to_torch_string();
+            let moved = tensor.call_method1(py, "to", (device_str,))?;
+            Ok(moved)
+        }
     }
 }
 
@@ -87,6 +164,7 @@ enum OpenMode {
 #[pyclass]
 struct SafeOpen {
     mode: OpenMode,
+    device: DeviceSpec,
 }
 
 impl SafeOpen {
@@ -174,9 +252,8 @@ impl SafeOpen {
                 framework.to_string(),
             ));
         }
-        if device != "cpu" {
-            return Err(SstPythonError::UnsupportedDevice(device.to_string()));
-        }
+        let device_spec = parse_device(device)?;
+        require_cuda_compiled(&device_spec)?;
 
         if is_url(path_or_url) {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -198,6 +275,7 @@ impl SafeOpen {
                     fetcher: Arc::new(fetcher),
                     runtime,
                 }),
+                device: device_spec,
             })
         } else {
             let file_bytes = std::fs::read(path_or_url)?;
@@ -206,6 +284,7 @@ impl SafeOpen {
 
             Ok(Self {
                 mode: OpenMode::Local(LocalMode { header, data }),
+                device: device_spec,
             })
         }
     }
@@ -233,11 +312,13 @@ impl SafeOpen {
             .collect()
     }
 
-    /// Fetch a tensor by name and return it as a torch.Tensor on CPU.
+    /// Fetch a tensor by name and return it as a torch.Tensor on the configured device.
     fn get_tensor(&self, py: Python<'_>, name: &str) -> PyResult<PyObject> {
         let tensor_info = self.find_tensor(name)?;
         let data = self.fetch_tensor_bytes(tensor_info)?;
-        bytes_to_tensor(py, &data, tensor_info.dtype, &tensor_info.shape)
+        let cpu_tensor = bytes_to_tensor(py, &data, tensor_info.dtype, &tensor_info.shape)?;
+        let result = tensor_to_device(py, cpu_tensor, &self.device)?;
+        Ok(result)
     }
 
     /// Return metadata from the header.
@@ -267,19 +348,22 @@ fn safe_open(path_or_url: &str, framework: &str, device: &str) -> Result<SafeOpe
 #[pyfunction]
 #[pyo3(signature = (path_or_url, *, device = "cpu"))]
 fn load_file(py: Python<'_>, path_or_url: &str, device: &str) -> Result<PyObject, SstPythonError> {
-    if device != "cpu" {
-        return Err(SstPythonError::UnsupportedDevice(device.to_string()));
-    }
+    let device_spec = parse_device(device)?;
+    require_cuda_compiled(&device_spec)?;
 
     if is_url(path_or_url) {
-        load_file_url(py, path_or_url)
+        load_file_url(py, path_or_url, &device_spec)
     } else {
-        load_file_local(py, path_or_url)
+        load_file_local(py, path_or_url, &device_spec)
     }
 }
 
 /// Load all tensors from a URL using StreamingPipeline.
-fn load_file_url(py: Python<'_>, url: &str) -> Result<PyObject, SstPythonError> {
+fn load_file_url(
+    py: Python<'_>,
+    url: &str,
+    device: &DeviceSpec,
+) -> Result<PyObject, SstPythonError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -297,14 +381,19 @@ fn load_file_url(py: Python<'_>, url: &str) -> Result<PyObject, SstPythonError> 
 
     let dict = pyo3::types::PyDict::new(py);
     for chunk in &chunks {
-        let tensor = bytes_to_tensor(py, &chunk.data, chunk.dtype, &chunk.shape)?;
+        let cpu_tensor = bytes_to_tensor(py, &chunk.data, chunk.dtype, &chunk.shape)?;
+        let tensor = tensor_to_device(py, cpu_tensor, device)?;
         dict.set_item(&chunk.name, tensor)?;
     }
     Ok(dict.into_pyobject(py)?.into())
 }
 
 /// Load all tensors from a local file.
-fn load_file_local(py: Python<'_>, path: &str) -> Result<PyObject, SstPythonError> {
+fn load_file_local(
+    py: Python<'_>,
+    path: &str,
+    device: &DeviceSpec,
+) -> Result<PyObject, SstPythonError> {
     let file_bytes = std::fs::read(path)?;
     let data = bytes::Bytes::from(file_bytes);
     let header = parse_header(&data)?;
@@ -313,7 +402,8 @@ fn load_file_local(py: Python<'_>, path: &str) -> Result<PyObject, SstPythonErro
     for tensor in &header.tensors {
         let (abs_start, abs_end) = tensor.absolute_offsets(header.data_start);
         let tensor_data = &data[abs_start..abs_end];
-        let t = bytes_to_tensor(py, tensor_data, tensor.dtype, &tensor.shape)?;
+        let cpu_tensor = bytes_to_tensor(py, tensor_data, tensor.dtype, &tensor.shape)?;
+        let t = tensor_to_device(py, cpu_tensor, device)?;
         dict.set_item(&tensor.name, t)?;
     }
     Ok(dict.into_pyobject(py)?.into())
@@ -341,6 +431,7 @@ enum StreamSource {
 #[pyclass]
 struct TensorStreamIterator {
     source: StreamSource,
+    device: DeviceSpec,
 }
 
 #[pymethods]
@@ -355,7 +446,8 @@ impl TensorStreamIterator {
                 let chunk = runtime.block_on(consumer.recv());
                 match chunk {
                     Some(c) => {
-                        let tensor = bytes_to_tensor(py, &c.data, c.dtype, &c.shape)?;
+                        let cpu_tensor = bytes_to_tensor(py, &c.data, c.dtype, &c.shape)?;
+                        let tensor = tensor_to_device(py, cpu_tensor, &self.device)?;
                         let tuple = PyTuple::new(py, &[c.name.into_pyobject(py)?.into_any(), tensor.bind(py).clone()])?;
                         Ok(Some(tuple.into_pyobject(py)?.into()))
                     }
@@ -374,7 +466,8 @@ impl TensorStreamIterator {
                 *index += 1;
                 let (abs_start, abs_end) = tensor_info.absolute_offsets(header.data_start);
                 let tensor_data = &data[abs_start..abs_end];
-                let tensor = bytes_to_tensor(py, tensor_data, tensor_info.dtype, &tensor_info.shape)?;
+                let cpu_tensor = bytes_to_tensor(py, tensor_data, tensor_info.dtype, &tensor_info.shape)?;
+                let tensor = tensor_to_device(py, cpu_tensor, &self.device)?;
                 let tuple = PyTuple::new(py, &[tensor_info.name.clone().into_pyobject(py)?.into_any(), tensor.bind(py).clone()])?;
                 Ok(Some(tuple.into_pyobject(py)?.into()))
             }
@@ -391,8 +484,11 @@ impl TensorStreamIterator {
 ///     for name, tensor in stream_tensors("https://..../model.safetensors"):
 ///         process(name, tensor)
 #[pyfunction]
-#[pyo3(signature = (path_or_url))]
-fn stream_tensors(path_or_url: &str) -> Result<TensorStreamIterator, SstPythonError> {
+#[pyo3(signature = (path_or_url, *, device = "cpu"))]
+fn stream_tensors(path_or_url: &str, device: &str) -> Result<TensorStreamIterator, SstPythonError> {
+    let device_spec = parse_device(device)?;
+    require_cuda_compiled(&device_spec)?;
+
     if is_url(path_or_url) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -407,6 +503,7 @@ fn stream_tensors(path_or_url: &str) -> Result<TensorStreamIterator, SstPythonEr
 
         Ok(TensorStreamIterator {
             source: StreamSource::Url { consumer, runtime },
+            device: device_spec,
         })
     } else {
         let file_bytes = std::fs::read(path_or_url)?;
@@ -419,8 +516,15 @@ fn stream_tensors(path_or_url: &str) -> Result<TensorStreamIterator, SstPythonEr
                 data,
                 index: 0,
             },
+            device: device_spec,
         })
     }
+}
+
+/// Returns whether the package was compiled with CUDA support.
+#[pyfunction]
+fn cuda_available() -> bool {
+    cfg!(feature = "cuda")
 }
 
 /// Returns the package version.
@@ -434,6 +538,7 @@ fn version() -> &'static str {
 fn safetensors_streaming(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
+    m.add_function(wrap_pyfunction!(cuda_available, m)?)?;
     m.add_function(wrap_pyfunction!(safe_open, m)?)?;
     m.add_function(wrap_pyfunction!(load_file, m)?)?;
     m.add_function(wrap_pyfunction!(stream_tensors, m)?)?;

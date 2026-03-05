@@ -3,6 +3,12 @@ name = "sst-gpu"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+cuda = ["dep:cudarc", "dep:sst-buffer", "dep:sst-types"]
+
 [dependencies]
 thiserror = { workspace = true }
 tracing = { workspace = true }
+cudarc = { workspace = true, optional = true }
+sst-buffer = { workspace = true, optional = true }
+sst-types = { workspace = true, optional = true }

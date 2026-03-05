@@ -1,13 +1,27 @@
-// sst-gpu: CUDA copy management (stub)
+// sst-gpu: CUDA copy management
 //
-// Modules (planned):
-// - device: CUDA device discovery and selection
-// - copy: Async H2D copy with pinned staging buffers
-// - stream: CUDA stream management for overlapping transfers
+// Modules:
+// - pinned: Ring buffer (HeapBuffer always, PinnedBuffer behind cuda feature)
+// - copy: Async H2D copy with pinned staging buffers (cuda only)
+// - pipeline: Full streaming pipeline Consumer -> pinned -> GPU (cuda only)
 
 pub mod error;
+pub mod pinned;
+
+#[cfg(feature = "cuda")]
+pub mod copy;
+#[cfg(feature = "cuda")]
+pub mod pipeline;
 
 pub use error::GpuError;
+pub use pinned::{HeapBuffer, HeapSlot};
+
+#[cfg(feature = "cuda")]
+pub use pinned::{PinnedBuffer, PinnedSlot};
+#[cfg(feature = "cuda")]
+pub use copy::{DeviceBuffer, GpuCopier};
+#[cfg(feature = "cuda")]
+pub use pipeline::{GpuPipeline, GpuTensor};
 
 /// Placeholder for GPU device handle.
 /// Will wrap CUDA device context when CUDA support is added.
