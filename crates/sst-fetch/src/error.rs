@@ -43,4 +43,16 @@ pub enum FetchError {
     #[cfg(feature = "s3")]
     #[error("S3 byte stream error: {0}")]
     S3ByteStream(String),
+
+    #[cfg(feature = "xet")]
+    #[error("Xet reconstruction error: {0}")]
+    XetReconstruction(String),
+
+    #[cfg(feature = "xet")]
+    #[error("Xet token fetch error: {0}")]
+    XetTokenFetch(String),
+
+    #[cfg(feature = "xet")]
+    #[error("Xet hash parse error: {0}")]
+    XetHashParse(String),
 }

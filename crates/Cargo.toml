@@ -37,3 +37,10 @@ tokio-stream = "0.1"
 aws-sdk-s3 = "1.125"
 aws-config = "1.8"
 cudarc = { version = "0.16", features = ["driver"] }
+
+# Xet-native fetch backend (HuggingFace Xet storage)
+cas_client = { git = "https://github.com/huggingface/xet-core", branch = "main" }
+cas_types = { git = "https://github.com/huggingface/xet-core", branch = "main" }
+file_reconstruction = { git = "https://github.com/huggingface/xet-core", branch = "main" }
+merklehash = { git = "https://github.com/huggingface/xet-core", branch = "main" }
+xet-core-utils = { git = "https://github.com/huggingface/xet-core", branch = "main", package = "utils" }

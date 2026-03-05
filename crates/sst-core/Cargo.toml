@@ -3,6 +3,10 @@ name = "sst-core"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["xet"]
+xet = ["sst-fetch/xet"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }

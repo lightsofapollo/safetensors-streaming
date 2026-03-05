@@ -1,4 +1,6 @@
 pub mod error;
+#[cfg(feature = "xet")]
+mod xet;
 
 pub use error::FetchError;
 
@@ -74,7 +76,7 @@ fn is_s3_url(url: &str) -> bool {
     url.starts_with("s3://")
 }
 
-/// Internal fetcher variant — HTTP or S3.
+/// Internal fetcher variant — HTTP, S3, or Xet.
 enum FetcherInner {
     Http {
         client: Client,
@@ -86,6 +88,12 @@ enum FetcherInner {
         client: aws_sdk_s3::Client,
         bucket: String,
         key: String,
+        total_size: u64,
+    },
+    #[cfg(feature = "xet")]
+    Xet {
+        cas_client: std::sync::Arc<dyn cas_client::Client>,
+        file_hash: merklehash::MerkleHash,
         total_size: u64,
     },
 }
@@ -128,7 +136,7 @@ impl RangeFetcher {
         Self::new_http(url).await
     }
 
-    /// Build an HTTP-backed fetcher.
+    /// Build an HTTP-backed fetcher (or Xet-backed if X-Xet-Hash is detected).
     async fn new_http(url: &str) -> Result<Self, FetchError> {
         let no_redirect_client = Client::builder()
             .use_rustls_tls()
@@ -153,6 +161,39 @@ impl RangeFetcher {
                 .map_err(FetchError::Request)?;
 
             let status = resp.status();
+
+            // Check for Xet-backed file before following redirect
+            #[cfg(feature = "xet")]
+            if let Some(xet_hash) = resp.headers().get("X-Xet-Hash") {
+                let xet_hash_str = xet_hash
+                    .to_str()
+                    .map_err(FetchError::InvalidHeader)?
+                    .to_string();
+
+                tracing::info!(xet_hash = %xet_hash_str, "detected Xet-backed file");
+
+                // Get total file size — try X-Linked-Size first (HF specific),
+                // then follow the redirect and HEAD the CDN URL for Content-Length
+                let total_size = if let Some(xls) = resp.headers().get("X-Linked-Size") {
+                    let s = xls.to_str().map_err(FetchError::InvalidHeader)?;
+                    s.parse::<u64>().map_err(|_| FetchError::MissingContentLength)?
+                } else if status.is_redirection() {
+                    let location = resp
+                        .headers()
+                        .get(reqwest::header::LOCATION)
+                        .ok_or(FetchError::MissingLocation)?
+                        .to_str()
+                        .map_err(FetchError::InvalidHeader)?;
+                    let head_resp = client.head(location).send().await
+                        .map_err(FetchError::Request)?;
+                    content_length_from_response(&head_resp)?
+                } else {
+                    return Err(FetchError::MissingContentLength);
+                };
+
+                return xet::new_xet_fetcher(url, &xet_hash_str, total_size, &client).await;
+            }
+
             if status.is_redirection() {
                 let location = resp
                     .headers()
@@ -275,6 +316,12 @@ impl RangeFetcher {
                 key,
                 ..
             } => Self::fetch_range_s3(client, bucket, key, start, end).await,
+            #[cfg(feature = "xet")]
+            FetcherInner::Xet {
+                cas_client,
+                file_hash,
+                ..
+            } => xet::fetch_range_xet(cas_client, file_hash, start, end).await,
         }
     }
 
@@ -426,6 +473,8 @@ impl RangeFetcher {
             FetcherInner::Http { total_size, .. } => *total_size,
             #[cfg(feature = "s3")]
             FetcherInner::S3 { total_size, .. } => *total_size,
+            #[cfg(feature = "xet")]
+            FetcherInner::Xet { total_size, .. } => *total_size,
         }
     }
 
@@ -435,6 +484,8 @@ impl RangeFetcher {
             FetcherInner::Http { url, .. } => url.clone(),
             #[cfg(feature = "s3")]
             FetcherInner::S3 { bucket, key, .. } => format!("s3://{bucket}/{key}"),
+            #[cfg(feature = "xet")]
+            FetcherInner::Xet { file_hash, .. } => format!("xet://{file_hash}"),
         }
     }
 }

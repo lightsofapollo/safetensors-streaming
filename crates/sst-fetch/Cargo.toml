@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 default = ["s3"]
 s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
+xet = ["dep:cas_client", "dep:file_reconstruction", "dep:merklehash", "dep:xet-core-utils", "dep:cas_types", "dep:serde", "dep:serde_json"]
 
 [dependencies]
 reqwest = { workspace = true }
@@ -15,6 +16,13 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 aws-sdk-s3 = { workspace = true, optional = true }
 aws-config = { workspace = true, optional = true }
+cas_client = { workspace = true, optional = true }
+cas_types = { workspace = true, optional = true }
+file_reconstruction = { workspace = true, optional = true }
+merklehash = { workspace = true, optional = true }
+xet-core-utils = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
