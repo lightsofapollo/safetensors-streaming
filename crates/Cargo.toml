@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "sst-types",
+    "sst-core",
+    "sst-fetch",
+    "sst-buffer",
+    "sst-gpu",
+    "sst-python",
+    "sst-cli",
+]
+resolver = "3"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["rustls-tls", "stream"] }
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py38"] }
+clap = { version = "4", features = ["derive"] }
+
+# Internal crates
+sst-core = { path = "sst-core" }
+sst-fetch = { path = "sst-fetch" }
+sst-buffer = { path = "sst-buffer" }
+sst-types = { path = "sst-types" }
+sst-gpu = { path = "sst-gpu" }
+futures = "0.3"
+tokio-stream = "0.1"

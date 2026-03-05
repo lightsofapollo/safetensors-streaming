@@ -1,0 +1,13 @@
+[package]
+name = "sst-python"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { workspace = true }
+sst-core = { workspace = true }
+sst-fetch = { workspace = true }
+sst-buffer = { workspace = true }

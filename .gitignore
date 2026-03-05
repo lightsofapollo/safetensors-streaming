@@ -1,0 +1,27 @@
+# Rust build artifacts (don't sync to GPU pod — compile on pod instead)
+crates/target/
+
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.so
+*.whl
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Beads
+.beads/dolt/
+
+# Environment
+.env

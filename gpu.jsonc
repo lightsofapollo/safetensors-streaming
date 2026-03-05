@@ -1,0 +1,31 @@
+{
+  "$schema": "https://gpu-cli.sh/schema/v1/gpu.json",
+  "project_id": "safetensors-streaming",
+  "gpu_types": [
+    { "type": "RTX 4090" },
+    { "type": "RTX A6000" }
+  ],
+  "min_vram": 24,
+  "outputs": ["benches/results/", "test-results/"],
+  "environment": {
+    "base_image": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+    "system": {
+      "apt": [{ "name": "curl" }]
+    },
+    "shell": {
+      "steps": [
+        // Install Rust toolchain on the pod
+        { "run": "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable" },
+        { "run": "echo 'source $HOME/.cargo/env' >> ~/.bashrc" },
+        // Install maturin for Python wheel building
+        { "run": "$HOME/.cargo/bin/cargo install maturin" },
+        // Install cargo-nextest for testing
+        { "run": "$HOME/.cargo/bin/cargo install cargo-nextest" }
+      ]
+    },
+    "python": {
+      "requirements": "requirements-dev.txt"
+    }
+  },
+  "keep_alive_minutes": 10
+}

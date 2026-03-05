@@ -1,0 +1,13 @@
+[package]
+name = "sst-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sst-core = { workspace = true }
+sst-fetch = { workspace = true }
+sst-buffer = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
