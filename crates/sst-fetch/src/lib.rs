@@ -219,6 +219,17 @@ impl RangeFetcher {
         })
     }
 
+    /// Fetch a contiguous range covering multiple tensors in one HTTP request.
+    /// `start` is inclusive, `end` is exclusive (byte past the last byte needed).
+    /// Returns the raw bytes for the entire range.
+    pub async fn fetch_batch(&self, start: u64, end: u64) -> Result<Bytes, FetchError> {
+        if start >= end {
+            return Ok(Bytes::new());
+        }
+        // fetch_range uses inclusive end
+        self.fetch_range(start, end - 1).await
+    }
+
     /// Fetch a byte range (inclusive start and end). Returns the raw bytes.
     pub async fn fetch_range(&self, start: u64, end: u64) -> Result<Bytes, FetchError> {
         match &self.inner {

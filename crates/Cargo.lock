@@ -2662,6 +2662,9 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "pyo3",
+ "reqwest",
+ "serde",
+ "serde_json",
  "sst-buffer",
  "sst-core",
  "sst-fetch",
@@ -2669,6 +2672,7 @@ dependencies = [
  "sst-types",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

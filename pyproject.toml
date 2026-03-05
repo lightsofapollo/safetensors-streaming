@@ -10,7 +10,8 @@ requires-python = ">=3.10"
 
 [tool.maturin]
 manifest-path = "crates/sst-python/Cargo.toml"
-module-name = "safetensors_streaming"
+module-name = "safetensors_streaming.safetensors_streaming"
+python-source = "python"
 features = ["pyo3/extension-module"]
 
 # Build instructions:

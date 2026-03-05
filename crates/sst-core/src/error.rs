@@ -21,4 +21,7 @@ pub enum CoreError {
 
     #[error("buffer error: {0}")]
     Buffer(#[from] sst_buffer::BufferError),
+
+    #[error("background task failed: {0}")]
+    JoinError(String),
 }

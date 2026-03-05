@@ -29,3 +29,5 @@ venv/
 
 # Environment
 .env
+.gpu/
+benches/results/.tmp*

@@ -22,9 +22,9 @@ enum Command {
         #[arg(long, default_value_t = false)]
         benchmark: bool,
 
-        /// Number of tensors to prefetch ahead
-        #[arg(long, default_value_t = 3)]
-        prefetch: usize,
+        /// Maximum batch size in bytes for grouped Range requests (0 = no batching)
+        #[arg(long, default_value_t = 16_777_216)]
+        batch_size: usize,
 
         /// Ring buffer capacity (max buffered chunks)
         #[arg(long, default_value_t = 8)]
@@ -62,10 +62,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Fetch {
             url,
             benchmark,
-            prefetch,
+            batch_size,
             buffer_size,
         } => {
-            run_fetch(&url, benchmark, prefetch, buffer_size).await?;
+            run_fetch(&url, benchmark, batch_size, buffer_size).await?;
         }
     }
 
@@ -75,11 +75,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_fetch(
     url: &str,
     benchmark: bool,
-    prefetch: usize,
+    batch_size: usize,
     buffer_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = PipelineConfig {
-        prefetch_ahead: prefetch,
+        batch_size_bytes: batch_size,
         buffer_capacity: buffer_size,
     };
 
