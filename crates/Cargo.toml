@@ -4,6 +4,7 @@ members = [
     "sst-core",
     "sst-fetch",
     "sst-buffer",
+    "sst-cache",
     "sst-gpu",
     "sst-python",
     "sst-cli",
@@ -28,5 +29,10 @@ sst-fetch = { path = "sst-fetch" }
 sst-buffer = { path = "sst-buffer" }
 sst-types = { path = "sst-types" }
 sst-gpu = { path = "sst-gpu" }
+sha2 = "0.10"
+dirs = "6"
+sst-cache = { path = "sst-cache" }
 futures = "0.3"
 tokio-stream = "0.1"
+aws-sdk-s3 = "1.125"
+aws-config = "1.8"

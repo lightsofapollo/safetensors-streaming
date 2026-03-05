@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 
 use crate::error::CoreError;
 use crate::types::{DType, Header, TensorInfo};

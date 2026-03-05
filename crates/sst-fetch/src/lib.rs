@@ -6,14 +6,64 @@ use bytes::Bytes;
 use reqwest::Client;
 use std::time::Duration;
 
-/// HTTP client for fetching byte ranges from safetensors files.
+/// Parsed S3 URL components.
+#[derive(Debug, Clone)]
+pub struct S3Url {
+    pub bucket: String,
+    pub key: String,
+}
+
+/// Parse an `s3://bucket/key` URL into bucket and key.
+/// Returns `None` if the URL doesn't start with `s3://` or is malformed.
+pub fn parse_s3_url(url: &str) -> Result<S3Url, FetchError> {
+    let rest = url
+        .strip_prefix("s3://")
+        .ok_or_else(|| FetchError::InvalidS3Url("URL must start with s3://".into()))?;
+
+    let (bucket, key) = rest
+        .split_once('/')
+        .ok_or_else(|| FetchError::InvalidS3Url("missing key after bucket name".into()))?;
+
+    if bucket.is_empty() {
+        return Err(FetchError::InvalidS3Url("empty bucket name".into()));
+    }
+    if key.is_empty() {
+        return Err(FetchError::InvalidS3Url("empty key".into()));
+    }
+
+    Ok(S3Url {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+    })
+}
+
+/// Returns true if the URL uses the `s3://` scheme.
+fn is_s3_url(url: &str) -> bool {
+    url.starts_with("s3://")
+}
+
+/// Internal fetcher variant — HTTP or S3.
+enum FetcherInner {
+    Http {
+        client: Client,
+        url: String,
+        total_size: u64,
+    },
+    #[cfg(feature = "s3")]
+    S3 {
+        client: aws_sdk_s3::Client,
+        bucket: String,
+        key: String,
+        total_size: u64,
+    },
+}
+
+/// Async client for fetching byte ranges from safetensors files.
 ///
-/// Handles HuggingFace redirect resolution (302 to CDN) and
-/// standard HTTP range requests for any URL.
+/// Supports HTTP(S) URLs (including HuggingFace redirects) and
+/// S3 native URLs (`s3://bucket/key`) when the `s3` feature is enabled.
 pub struct RangeFetcher {
-    client: Client,
-    url: String,
-    total_size: u64,
+    inner: FetcherInner,
 }
 
 /// Check if a URL is a HuggingFace resolve URL that needs redirect handling.
@@ -22,11 +72,32 @@ fn is_hf_resolve_url(url: &str) -> bool {
 }
 
 impl RangeFetcher {
-    /// Create a new fetcher. For HuggingFace URLs, resolves the redirect
-    /// to get the actual CDN URL. For other URLs, uses the URL directly.
+    /// Create a new fetcher.
     ///
-    /// Fetches total file size via a HEAD request (or from the redirect response).
+    /// - For `s3://` URLs: uses AWS SDK with default credential chain
+    /// - For HuggingFace URLs: resolves the redirect to the CDN URL
+    /// - For other HTTP(S) URLs: uses the URL directly
+    ///
+    /// Fetches total file size via HEAD (HTTP) or HeadObject (S3).
     pub async fn new(url: &str) -> Result<Self, FetchError> {
+        if is_s3_url(url) {
+            #[cfg(feature = "s3")]
+            {
+                return Self::new_s3(url).await;
+            }
+            #[cfg(not(feature = "s3"))]
+            {
+                return Err(FetchError::InvalidS3Url(
+                    "S3 support not enabled — build with feature 's3'".into(),
+                ));
+            }
+        }
+
+        Self::new_http(url).await
+    }
+
+    /// Build an HTTP-backed fetcher.
+    async fn new_http(url: &str) -> Result<Self, FetchError> {
         let no_redirect_client = Client::builder()
             .use_rustls_tls()
             .redirect(reqwest::redirect::Policy::none())
@@ -88,23 +159,94 @@ impl RangeFetcher {
             (url.to_string(), size)
         };
 
-        tracing::info!(url = %resolved_url, total_size, "RangeFetcher ready");
+        tracing::info!(url = %resolved_url, total_size, "RangeFetcher ready (HTTP)");
 
         Ok(Self {
-            client,
-            url: resolved_url,
+            inner: FetcherInner::Http {
+                client,
+                url: resolved_url,
+                total_size,
+            },
+        })
+    }
+
+    /// Build an S3-backed fetcher.
+    #[cfg(feature = "s3")]
+    async fn new_s3(url: &str) -> Result<Self, FetchError> {
+        let parsed = parse_s3_url(url)?;
+
+        tracing::debug!(
+            bucket = %parsed.bucket,
+            key = %parsed.key,
+            "initializing S3 fetcher"
+        );
+
+        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let s3_client = aws_sdk_s3::Client::new(&config);
+
+        // HeadObject to get total file size
+        let head = s3_client
+            .head_object()
+            .bucket(&parsed.bucket)
+            .key(&parsed.key)
+            .send()
+            .await
+            .map_err(|e| FetchError::S3HeadObject(e.to_string()))?;
+
+        let total_size = head
+            .content_length()
+            .ok_or(FetchError::S3MissingContentLength)?;
+
+        if total_size < 0 {
+            return Err(FetchError::S3MissingContentLength);
+        }
+        let total_size = total_size as u64;
+
+        tracing::info!(
+            bucket = %parsed.bucket,
+            key = %parsed.key,
             total_size,
+            "RangeFetcher ready (S3)"
+        );
+
+        Ok(Self {
+            inner: FetcherInner::S3 {
+                client: s3_client,
+                bucket: parsed.bucket,
+                key: parsed.key,
+                total_size,
+            },
         })
     }
 
     /// Fetch a byte range (inclusive start and end). Returns the raw bytes.
     pub async fn fetch_range(&self, start: u64, end: u64) -> Result<Bytes, FetchError> {
-        let range = format!("bytes={start}-{end}");
-        tracing::debug!(url = %self.url, %range, "fetching byte range");
+        match &self.inner {
+            FetcherInner::Http { client, url, .. } => {
+                Self::fetch_range_http(client, url, start, end).await
+            }
+            #[cfg(feature = "s3")]
+            FetcherInner::S3 {
+                client,
+                bucket,
+                key,
+                ..
+            } => Self::fetch_range_s3(client, bucket, key, start, end).await,
+        }
+    }
 
-        let response = self
-            .client
-            .get(&self.url)
+    /// HTTP range fetch implementation.
+    async fn fetch_range_http(
+        client: &Client,
+        url: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Bytes, FetchError> {
+        let range = format!("bytes={start}-{end}");
+        tracing::debug!(url, %range, "fetching byte range (HTTP)");
+
+        let response = client
+            .get(url)
             .header(reqwest::header::RANGE, &range)
             .send()
             .await
@@ -113,7 +255,6 @@ impl RangeFetcher {
         let status = response.status();
 
         if status.as_u16() == 206 {
-            // Partial content — expected
             return response.bytes().await.map_err(FetchError::Body);
         }
 
@@ -126,6 +267,36 @@ impl RangeFetcher {
         }
 
         Err(FetchError::UnexpectedStatus(status.as_u16()))
+    }
+
+    /// S3 range fetch implementation.
+    #[cfg(feature = "s3")]
+    async fn fetch_range_s3(
+        client: &aws_sdk_s3::Client,
+        bucket: &str,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Bytes, FetchError> {
+        let range = format!("bytes={start}-{end}");
+        tracing::debug!(bucket, key, %range, "fetching byte range (S3)");
+
+        let resp = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .range(&range)
+            .send()
+            .await
+            .map_err(|e| FetchError::S3GetObject(e.to_string()))?;
+
+        let body = resp
+            .body
+            .collect()
+            .await
+            .map_err(|e| FetchError::S3ByteStream(e.to_string()))?;
+
+        Ok(body.into_bytes())
     }
 
     /// Fetch the safetensors header: first 8 bytes for the size prefix,
@@ -155,12 +326,20 @@ impl RangeFetcher {
 
     /// Total file size in bytes.
     pub fn total_size(&self) -> u64 {
-        self.total_size
+        match &self.inner {
+            FetcherInner::Http { total_size, .. } => *total_size,
+            #[cfg(feature = "s3")]
+            FetcherInner::S3 { total_size, .. } => *total_size,
+        }
     }
 
-    /// The resolved URL used for fetching.
-    pub fn url(&self) -> &str {
-        &self.url
+    /// The resolved URL (or `s3://bucket/key`) used for fetching.
+    pub fn url(&self) -> String {
+        match &self.inner {
+            FetcherInner::Http { url, .. } => url.clone(),
+            #[cfg(feature = "s3")]
+            FetcherInner::S3 { bucket, key, .. } => format!("s3://{bucket}/{key}"),
+        }
     }
 }
 
@@ -187,6 +366,68 @@ fn content_length_from_response(resp: &reqwest::Response) -> Result<u64, FetchEr
 mod tests {
     use super::*;
 
+    // ── S3 URL parsing (no network) ──────────────────────────────────
+
+    #[test]
+    fn test_parse_s3_url_basic() {
+        let parsed = parse_s3_url("s3://my-bucket/path/to/model.safetensors");
+        assert!(parsed.is_ok());
+        let s3 = parsed.unwrap();
+        assert_eq!(s3.bucket, "my-bucket");
+        assert_eq!(s3.key, "path/to/model.safetensors");
+    }
+
+    #[test]
+    fn test_parse_s3_url_single_key() {
+        let parsed = parse_s3_url("s3://bucket/file.bin");
+        assert!(parsed.is_ok());
+        let s3 = parsed.unwrap();
+        assert_eq!(s3.bucket, "bucket");
+        assert_eq!(s3.key, "file.bin");
+    }
+
+    #[test]
+    fn test_parse_s3_url_nested_key() {
+        let parsed = parse_s3_url("s3://b/a/b/c/d/e.safetensors");
+        assert!(parsed.is_ok());
+        let s3 = parsed.unwrap();
+        assert_eq!(s3.bucket, "b");
+        assert_eq!(s3.key, "a/b/c/d/e.safetensors");
+    }
+
+    #[test]
+    fn test_parse_s3_url_not_s3() {
+        let parsed = parse_s3_url("https://example.com/file.bin");
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn test_parse_s3_url_empty_bucket() {
+        let parsed = parse_s3_url("s3:///key");
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn test_parse_s3_url_empty_key() {
+        let parsed = parse_s3_url("s3://bucket/");
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn test_parse_s3_url_no_key() {
+        let parsed = parse_s3_url("s3://bucket");
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn test_is_s3_url() {
+        assert!(is_s3_url("s3://bucket/key"));
+        assert!(!is_s3_url("https://example.com"));
+        assert!(!is_s3_url("http://example.com"));
+    }
+
+    // ── HTTP tests (network required) ────────────────────────────────
+
     const HF_MODEL_URL: &str = "https://huggingface.co/google/bert_uncased_L-2_H-128_A-2/resolve/main/model.safetensors";
 
     #[tokio::test]
@@ -199,8 +440,6 @@ mod tests {
             fetcher.url()
         );
         assert!(fetcher.total_size() > 0, "total_size should be > 0");
-        println!("Resolved URL: {}", fetcher.url());
-        println!("Total size: {} bytes", fetcher.total_size());
     }
 
     #[tokio::test]
@@ -210,7 +449,6 @@ mod tests {
         assert_eq!(size_bytes.len(), 8, "should get exactly 8 bytes");
 
         let header_len = u64::from_le_bytes(size_bytes[..8].try_into().unwrap());
-        println!("Header length: {} bytes", header_len);
         assert!(header_len > 0 && header_len < 10_000_000, "header length should be reasonable");
     }
 
@@ -229,10 +467,7 @@ mod tests {
 
         // BERT model should have known tensor names
         let obj = parsed.as_object().unwrap();
-        println!("Header contains {} entries", obj.len());
-        for key in obj.keys().take(5) {
-            println!("  tensor: {key}");
-        }
+        assert!(obj.len() > 0, "header should contain entries");
     }
 
     #[tokio::test]
@@ -254,8 +489,6 @@ mod tests {
         let end = offsets[1].as_u64().unwrap();
         let tensor_size = end - start;
 
-        println!("Fetching tensor '{tensor_name}': bytes {start}..{end} ({tensor_size} bytes)");
-
         // Offset from file start: header_size(8) + header_json_len + data_offset
         let header_len = u64::from_le_bytes(
             fetcher.fetch_range(0, 7).await.unwrap()[..8].try_into().unwrap()
@@ -266,9 +499,8 @@ mod tests {
         let tensor_bytes = fetcher.fetch_range(data_start, data_end).await.unwrap();
         assert_eq!(
             tensor_bytes.len() as u64, tensor_size,
-            "fetched tensor size should match expected"
+            "fetched tensor size should match expected for '{tensor_name}'"
         );
-        println!("Successfully fetched {tensor_size} bytes for tensor '{tensor_name}'");
     }
 
     #[tokio::test]
@@ -285,11 +517,31 @@ mod tests {
             total >= 8 + header_len,
             "total_size ({total}) should be >= 8 + header_len ({header_len})"
         );
-        println!(
-            "Total: {total}, header: {header_len}, data: {} bytes",
-            total - 8 - header_len
-        );
         // Verify the header JSON size matches what we fetched
         assert_eq!(header_json.len() as u64, header_len);
+    }
+
+    // ── S3 integration test (requires real credentials) ──────────────
+
+    #[cfg(feature = "s3")]
+    #[tokio::test]
+    #[ignore = "requires AWS credentials and a real S3 bucket"]
+    async fn test_s3_fetch_header() {
+        // Set S3_TEST_URL env var to an s3://bucket/key pointing to a .safetensors file
+        let url = std::env::var("S3_TEST_URL")
+            .unwrap_or_else(|_| "s3://test-bucket/model.safetensors".to_string());
+
+        let fetcher = RangeFetcher::new(&url).await.unwrap();
+        assert!(fetcher.total_size() > 0);
+
+        let (size_bytes, header_json) = fetcher.fetch_header().await.unwrap();
+        assert_eq!(size_bytes.len(), 8);
+
+        let header_len = u64::from_le_bytes(size_bytes[..8].try_into().unwrap());
+        assert_eq!(header_json.len(), header_len as usize);
+
+        // Validate it's valid JSON
+        let parsed: serde_json::Value = serde_json::from_slice(&header_json).unwrap();
+        assert!(parsed.is_object());
     }
 }

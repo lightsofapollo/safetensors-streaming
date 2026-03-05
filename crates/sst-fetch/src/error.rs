@@ -1,4 +1,4 @@
-/// Errors from HTTP fetching operations.
+/// Errors from fetching operations (HTTP and S3).
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
     #[error("failed to build HTTP client: {0}")]
@@ -24,4 +24,23 @@ pub enum FetchError {
 
     #[error("invalid header value: {0}")]
     InvalidHeader(reqwest::header::ToStrError),
+
+    #[error("invalid S3 URL: {0}")]
+    InvalidS3Url(String),
+
+    #[cfg(feature = "s3")]
+    #[error("S3 GetObject failed: {0}")]
+    S3GetObject(String),
+
+    #[cfg(feature = "s3")]
+    #[error("S3 HeadObject failed: {0}")]
+    S3HeadObject(String),
+
+    #[cfg(feature = "s3")]
+    #[error("S3 response missing content length")]
+    S3MissingContentLength,
+
+    #[cfg(feature = "s3")]
+    #[error("S3 byte stream error: {0}")]
+    S3ByteStream(String),
 }

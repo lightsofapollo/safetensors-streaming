@@ -22,8 +22,10 @@ pub enum DType {
 #[error("unknown dtype: {0:?}")]
 pub struct UnknownDTypeError(pub String);
 
-impl DType {
-    pub fn from_str(s: &str) -> Result<Self, UnknownDTypeError> {
+impl std::str::FromStr for DType {
+    type Err = UnknownDTypeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "BOOL" => Ok(Self::Bool),
             "U8" => Ok(Self::U8),
@@ -38,7 +40,9 @@ impl DType {
             other => Err(UnknownDTypeError(other.to_string())),
         }
     }
+}
 
+impl DType {
     /// Size of a single element in bytes.
     pub fn byte_size(self) -> usize {
         match self {
