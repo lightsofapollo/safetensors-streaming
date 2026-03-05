@@ -7,9 +7,13 @@ use sst_buffer::{Consumer, Producer, TensorChunk};
 use sst_fetch::RangeFetcher;
 use std::sync::Arc;
 
-/// Default batch size: 16 MiB. Tensors are grouped into contiguous batches
+/// Default batch size: 256 MiB. Tensors are grouped into contiguous batches
 /// up to this size, each fetched with a single HTTP Range request.
-const DEFAULT_BATCH_SIZE_BYTES: usize = 16 * 1024 * 1024;
+/// Larger batches reduce per-request overhead at the cost of more memory.
+const DEFAULT_BATCH_SIZE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Number of batches to prefetch concurrently ahead of consumption.
+const PREFETCH_AHEAD: usize = 4;
 
 /// Configuration for the streaming pipeline.
 pub struct PipelineConfig {
@@ -70,6 +74,9 @@ impl StreamingPipeline {
 
     /// Start streaming tensors. Spawns a background tokio task that fetches tensor data
     /// and pushes chunks through the returned Consumer.
+    ///
+    /// For HTTP backends, uses a single streaming GET request for the entire data section
+    /// (matching curl-like throughput). For S3/Xet, falls back to batched Range requests.
     pub fn stream(self) -> Consumer {
         let (producer, consumer) = sst_buffer::channel(self.config.buffer_capacity);
         let header = self.header;
@@ -77,7 +84,10 @@ impl StreamingPipeline {
         let batch_size_bytes = self.config.batch_size_bytes;
 
         tokio::spawn(async move {
-            let result = if batch_size_bytes == 0 {
+            let result = if fetcher.is_http() {
+                // Single streaming download — maximum throughput
+                fetch_all_tensors_streaming(&fetcher, &header, &producer).await
+            } else if batch_size_bytes == 0 {
                 fetch_all_tensors_unbatched(&fetcher, &header, &producer).await
             } else {
                 fetch_all_tensors_batched(&fetcher, &header, &producer, batch_size_bytes).await
@@ -176,26 +186,36 @@ async fn fetch_all_tensors_batched(
         return Ok(());
     }
 
-    // Prefetch the first batch
-    let mut pending_fetch: Option<tokio::task::JoinHandle<Result<bytes::Bytes, sst_fetch::FetchError>>> = None;
+    // Launch up to PREFETCH_AHEAD concurrent fetches
+    let mut pending: std::collections::VecDeque<tokio::task::JoinHandle<Result<bytes::Bytes, sst_fetch::FetchError>>> =
+        std::collections::VecDeque::new();
+
+    // Seed the prefetch queue
+    let prefetch_count = batches.len().min(PREFETCH_AHEAD);
+    for batch in batches.iter().take(prefetch_count) {
+        let start = batch.abs_start;
+        let end = batch.abs_end;
+        let f = Arc::clone(fetcher);
+        pending.push_back(tokio::spawn(async move { f.fetch_batch(start, end).await }));
+    }
+    let mut next_to_launch = prefetch_count;
 
     for (i, batch) in batches.iter().enumerate() {
-        // Start fetch for this batch (or use prefetched result)
-        let batch_data = if let Some(handle) = pending_fetch.take() {
-            handle.await.map_err(|e| CoreError::JoinError(e.to_string()))??
-        } else {
-            fetcher.fetch_batch(batch.abs_start, batch.abs_end).await?
-        };
+        // Await the next completed fetch
+        let batch_data = pending
+            .pop_front()
+            .expect("prefetch queue empty")
+            .await
+            .map_err(|e| CoreError::JoinError(e.to_string()))??;
 
-        // Prefetch the next batch concurrently
-        if i + 1 < batches.len() {
-            let next_batch = &batches[i + 1];
-            let next_start = next_batch.abs_start;
-            let next_end = next_batch.abs_end;
-            let fetcher_clone = Arc::clone(fetcher);
-            pending_fetch = Some(tokio::spawn(async move {
-                fetcher_clone.fetch_batch(next_start, next_end).await
-            }));
+        // Launch next fetch to keep the pipeline full
+        if next_to_launch < batches.len() {
+            let nb = &batches[next_to_launch];
+            let start = nb.abs_start;
+            let end = nb.abs_end;
+            let f = Arc::clone(fetcher);
+            pending.push_back(tokio::spawn(async move { f.fetch_batch(start, end).await }));
+            next_to_launch += 1;
         }
 
         tracing::debug!(
@@ -231,6 +251,54 @@ async fn fetch_all_tensors_batched(
 
             producer.send(chunk).await?;
         }
+    }
+
+    Ok(())
+}
+
+/// Download all tensor data via a single GET request, then slice into tensors.
+/// Uses `response.bytes()` for maximum download throughput.
+async fn fetch_all_tensors_streaming(
+    fetcher: &Arc<RangeFetcher>,
+    header: &Header,
+    producer: &Producer,
+) -> Result<(), CoreError> {
+    let data_start = header.data_start as u64;
+    let total_size = fetcher.total_size();
+
+    tracing::info!(
+        total_tensors = header.tensors.len(),
+        data_start,
+        total_size,
+        "single GET download mode"
+    );
+
+    // Download entire data section at once — maximum throughput, single HTTP connection
+    let data = fetcher
+        .fetch_range(data_start, total_size - 1)
+        .await?;
+
+    tracing::info!(bytes = data.len(), "data section downloaded");
+
+    // Slice into individual tensors (zero-copy via Bytes::slice)
+    for tensor in &header.tensors {
+        let rel_start = tensor.data_offsets.0;
+        let rel_end = tensor.data_offsets.1;
+
+        let tensor_data = if rel_start == rel_end {
+            bytes::Bytes::new()
+        } else {
+            data.slice(rel_start..rel_end)
+        };
+
+        let chunk = TensorChunk {
+            name: tensor.name.clone(),
+            data: tensor_data,
+            dtype: tensor.dtype,
+            shape: tensor.shape.clone(),
+        };
+
+        producer.send(chunk).await?;
     }
 
     Ok(())

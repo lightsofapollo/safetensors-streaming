@@ -17,6 +17,7 @@ sst-types = { workspace = true }
 sst-fetch = { workspace = true }
 sst-buffer = { workspace = true }
 tokio = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

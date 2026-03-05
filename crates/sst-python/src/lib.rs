@@ -550,7 +550,6 @@ fn fetch_index(
     if is_url(index_url_or_path) {
         let json_bytes: bytes::Bytes = runtime.block_on(async {
             let client = reqwest::Client::builder()
-                .use_rustls_tls()
                 .timeout(std::time::Duration::from_secs(60))
                 .build()
                 .map_err(SstPythonError::Reqwest)?;

@@ -139,30 +139,39 @@ impl RangeFetcher {
     /// Build an HTTP-backed fetcher (or Xet-backed if X-Xet-Hash is detected).
     async fn new_http(url: &str) -> Result<Self, FetchError> {
         let no_redirect_client = Client::builder()
-            .use_rustls_tls()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(FetchError::HttpClient)?;
 
+        // Main client: no total timeout (streaming large files can take minutes).
+        // HTTP/1.1 only — avoids HTTP/2 framing overhead for large downloads.
         let client = Client::builder()
-            .use_rustls_tls()
-            .timeout(Duration::from_secs(30))
+            .http1_only()
             .build()
             .map_err(FetchError::HttpClient)?;
 
         let (resolved_url, total_size) = if is_hf_resolve_url(url) {
             tracing::debug!(url, "resolving HuggingFace redirect");
 
-            let resp = no_redirect_client
-                .get(url)
+            let mut req = no_redirect_client.get(url);
+
+            // Add HF_TOKEN for authentication (required for gated models)
+            if let Ok(hf_token) = std::env::var("HF_TOKEN") {
+                req = req.header("Authorization", format!("Bearer {hf_token}"));
+            } else if let Ok(hf_token) = std::env::var("HUGGING_FACE_HUB_TOKEN") {
+                req = req.header("Authorization", format!("Bearer {hf_token}"));
+            }
+
+            let resp = req
                 .send()
                 .await
                 .map_err(FetchError::Request)?;
 
             let status = resp.status();
 
-            // Check for Xet-backed file before following redirect
+            // Try Xet-backed fetch if X-Xet-Hash header is present.
+            // Falls back to HTTP Range requests if Xet setup fails (e.g., token 404).
             #[cfg(feature = "xet")]
             if let Some(xet_hash) = resp.headers().get("X-Xet-Hash") {
                 let xet_hash_str = xet_hash
@@ -191,7 +200,13 @@ impl RangeFetcher {
                     return Err(FetchError::MissingContentLength);
                 };
 
-                return xet::new_xet_fetcher(url, &xet_hash_str, total_size, &client).await;
+                match xet::new_xet_fetcher(url, &xet_hash_str, total_size, &client).await {
+                    Ok(fetcher) => return Ok(fetcher),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Xet setup failed, falling back to HTTP Range requests");
+                        // Fall through to standard HTTP path below
+                    }
+                }
             }
 
             if status.is_redirection() {
@@ -290,6 +305,51 @@ impl RangeFetcher {
                 total_size,
             },
         })
+    }
+
+    /// Start a streaming download from byte `start` to end-of-file.
+    /// Returns a reqwest::Response whose body can be read as a byte stream.
+    /// Only supported for HTTP backends; returns an error for S3/Xet.
+    pub async fn start_streaming_download(
+        &self,
+        start: u64,
+    ) -> Result<reqwest::Response, FetchError> {
+        match &self.inner {
+            FetcherInner::Http { client, url, .. } => {
+                let range = format!("bytes={start}-");
+                tracing::debug!(url, %range, "starting streaming download");
+
+                let mut req = client.get(url).header(reqwest::header::RANGE, &range);
+
+                // Add HF_TOKEN for authenticated access
+                if let Ok(hf_token) = std::env::var("HF_TOKEN") {
+                    req = req.header("Authorization", format!("Bearer {hf_token}"));
+                } else if let Ok(hf_token) = std::env::var("HUGGING_FACE_HUB_TOKEN") {
+                    req = req.header("Authorization", format!("Bearer {hf_token}"));
+                }
+
+                let resp = req.send().await.map_err(FetchError::Request)?;
+                let status = resp.status().as_u16();
+                if status != 206 && status != 200 {
+                    return Err(FetchError::UnexpectedStatus(status));
+                }
+
+                Ok(resp)
+            }
+            #[cfg(feature = "s3")]
+            FetcherInner::S3 { .. } => Err(FetchError::InvalidS3Url(
+                "streaming download not supported for S3 backend".into(),
+            )),
+            #[cfg(feature = "xet")]
+            FetcherInner::Xet { .. } => Err(FetchError::XetReconstruction(
+                "streaming download not supported for Xet backend".into(),
+            )),
+        }
+    }
+
+    /// Returns true if this fetcher uses HTTP (supports streaming download).
+    pub fn is_http(&self) -> bool {
+        matches!(&self.inner, FetcherInner::Http { .. })
     }
 
     /// Fetch a contiguous range covering multiple tensors in one HTTP request.
