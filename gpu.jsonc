@@ -10,22 +10,21 @@
   "environment": {
     "base_image": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
     "system": {
-      "apt": [{ "name": "curl" }]
+      "apt": [{ "name": "curl" }, { "name": "pkg-config" }, { "name": "libssl-dev" }]
     },
     "shell": {
       "steps": [
-        // Install Rust toolchain on the pod
+        // Install Rust toolchain (gpu-cli sets CARGO_HOME=/gpu-cli-workspaces/.cache/cargo)
         { "run": "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable" },
-        { "run": "echo 'source $HOME/.cargo/env' >> ~/.bashrc" },
-        // Install maturin for Python wheel building
-        { "run": "$HOME/.cargo/bin/cargo install maturin" },
-        // Install cargo-nextest for testing
-        { "run": "$HOME/.cargo/bin/cargo install cargo-nextest" }
+        // Install nextest (pre-built binary) and maturin (via pip, faster than cargo install)
+        { "run": "curl -LsSf https://get.nexte.st/latest/linux | tar zxf - --no-same-owner -C /gpu-cli-workspaces/.cache/cargo/bin" },
+        { "run": "pip install maturin" }
       ]
     },
     "python": {
       "requirements": "requirements-dev.txt"
     }
   },
-  "keep_alive_minutes": 10
+  "keep_alive_minutes": 10,
+  "volume_mode": "global"
 }

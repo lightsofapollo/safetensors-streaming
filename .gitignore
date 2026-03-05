@@ -23,5 +23,9 @@ build/
 # Beads
 .beads/dolt/
 
+# Virtual environments (don't sync to GPU pod)
+.venv/
+venv/
+
 # Environment
 .env
