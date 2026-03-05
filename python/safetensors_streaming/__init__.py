@@ -6,11 +6,14 @@ monkey-patching helpers: ``patch``, ``unpatch``, and ``patched``.
 
 from safetensors_streaming.safetensors_streaming import (  # type: ignore[import-untyped]
     SafeOpen,
+    ShardedTensorStreamIterator,
     TensorStreamIterator,
     __version__,
     cuda_available,
     load_file,
+    load_sharded,
     safe_open,
+    stream_sharded,
     stream_tensors,
     version,
 )
@@ -20,11 +23,14 @@ from safetensors_streaming.progress import tqdm_load_file, tqdm_stream_tensors
 __all__ = [
     # Native API
     "SafeOpen",
+    "ShardedTensorStreamIterator",
     "TensorStreamIterator",
     "__version__",
     "cuda_available",
     "load_file",
+    "load_sharded",
     "safe_open",
+    "stream_sharded",
     "stream_tensors",
     "version",
     # Monkey-patching helpers

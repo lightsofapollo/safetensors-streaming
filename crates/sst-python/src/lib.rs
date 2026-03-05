@@ -414,7 +414,10 @@ fn load_file_url(
     // because curl runs on a blocking thread, the bridge on a worker thread,
     // and conversion on the main thread.
     loop {
-        let chunk = runtime.block_on(consumer.recv());
+        // Release the GIL while waiting for the next tensor to arrive.
+        // This lets other Python threads run and avoids competing with
+        // the tokio worker threads for CPU.
+        let chunk = py.allow_threads(|| runtime.block_on(consumer.recv()));
         match chunk {
             Some(c) => {
                 let cpu_tensor = bytes_to_tensor(py, &c.data, c.dtype, &c.shape)?;
@@ -530,7 +533,8 @@ fn stream_tensors(path_or_url: &str, device: &str) -> Result<TensorStreamIterato
     require_cuda_compiled(&device_spec)?;
 
     if is_url(path_or_url) {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()
             .map_err(SstPythonError::Io)?;
@@ -633,6 +637,9 @@ fn group_by_shard(weight_map: &HashMap<String, String>) -> HashMap<String, Vec<S
 /// Parses the index, discovers shard files, fetches all shards concurrently,
 /// and returns a merged dict of all tensors.
 ///
+/// Downloads all shards in parallel with overlapped tensor conversion — tensors
+/// are converted to PyTorch as they arrive, not buffered first.
+///
 /// Returns: Dict[str, torch.Tensor]
 #[pyfunction]
 #[pyo3(signature = (index_url_or_path, *, device = "cpu"))]
@@ -658,41 +665,57 @@ fn load_sharded(
         "loading sharded model"
     );
 
-    // For each unique shard, resolve its full path/URL and fetch all tensors concurrently
-    let all_chunks: Vec<TensorChunk> = if is_url(index_url_or_path) {
-        runtime.block_on(async {
-            let mut handles: Vec<tokio::task::JoinHandle<Result<Vec<TensorChunk>, SstPythonError>>> =
-                Vec::with_capacity(shard_groups.len());
+    let dict = pyo3::types::PyDict::new(py);
 
-            for shard_filename in shard_groups.keys() {
-                let shard_url = resolve_shard_path(index_url_or_path, shard_filename);
-                let shard_filename_owned = shard_filename.clone();
+    if is_url(index_url_or_path) {
+        // Merged channel: all shards send chunks into one receiver.
+        // Capacity sized to shard count to avoid backpressure stalls.
+        let (merged_tx, mut merged_rx) =
+            tokio::sync::mpsc::channel::<TensorChunk>(shard_groups.len() * 4);
 
-                handles.push(tokio::spawn(async move {
+        // Spawn concurrent download tasks for all shards
+        for shard_filename in shard_groups.keys() {
+            let shard_url = resolve_shard_path(index_url_or_path, shard_filename);
+            let tx = merged_tx.clone();
+            let shard_filename_owned = shard_filename.clone();
+
+            runtime.spawn(async move {
+                let result: Result<(), SstPythonError> = async {
                     tracing::info!(shard = %shard_filename_owned, "fetching shard");
                     let pipeline =
                         StreamingPipeline::from_url(&shard_url, PipelineConfig::default()).await?;
                     let mut consumer = pipeline.stream();
-                    let mut chunks = Vec::new();
                     while let Some(chunk) = consumer.recv().await {
-                        chunks.push(chunk);
+                        if tx.send(chunk).await.is_err() {
+                            break;
+                        }
                     }
-                    Ok(chunks)
-                }));
-            }
+                    Ok(())
+                }
+                .await;
+                if let Err(e) = result {
+                    tracing::error!(shard = %shard_filename_owned, error = %e, "shard fetch failed");
+                }
+            });
+        }
+        // Drop original sender so channel closes when all shard tasks complete
+        drop(merged_tx);
 
-            let mut all = Vec::new();
-            for handle in handles {
-                let chunks = handle
-                    .await
-                    .map_err(|e| SstPythonError::Join(e.to_string()))??;
-                all.extend(chunks);
+        // Convert tensors as they arrive — overlaps download with conversion.
+        // Release GIL while waiting for chunks so tokio threads run freely.
+        loop {
+            let chunk = py.allow_threads(|| runtime.block_on(merged_rx.recv()));
+            match chunk {
+                Some(c) => {
+                    let cpu_tensor = bytes_to_tensor(py, &c.data, c.dtype, &c.shape)?;
+                    let tensor = tensor_to_device(py, cpu_tensor, &device_spec)?;
+                    dict.set_item(&c.name, tensor)?;
+                }
+                None => break,
             }
-            Ok::<_, SstPythonError>(all)
-        })?
+        }
     } else {
         // Local: read each shard file
-        let mut all = Vec::new();
         for shard_filename in shard_groups.keys() {
             let shard_path = resolve_shard_path(index_url_or_path, shard_filename);
             let file_bytes = std::fs::read(&shard_path)?;
@@ -700,24 +723,14 @@ fn load_sharded(
             let header = parse_header(&data)?;
             for tensor in &header.tensors {
                 let (abs_start, abs_end) = tensor.absolute_offsets(header.data_start);
-                let tensor_data = data.slice(abs_start..abs_end);
-                all.push(TensorChunk {
-                    name: tensor.name.clone(),
-                    data: tensor_data,
-                    dtype: tensor.dtype,
-                    shape: tensor.shape.clone(),
-                });
+                let tensor_data = &data[abs_start..abs_end];
+                let cpu_tensor = bytes_to_tensor(py, tensor_data, tensor.dtype, &tensor.shape)?;
+                let t = tensor_to_device(py, cpu_tensor, &device_spec)?;
+                dict.set_item(&tensor.name, t)?;
             }
         }
-        all
-    };
-
-    let dict = pyo3::types::PyDict::new(py);
-    for chunk in &all_chunks {
-        let cpu_tensor = bytes_to_tensor(py, &chunk.data, chunk.dtype, &chunk.shape)?;
-        let tensor = tensor_to_device(py, cpu_tensor, &device_spec)?;
-        dict.set_item(&chunk.name, tensor)?;
     }
+
     Ok(dict.into_pyobject(py)?.into())
 }
 
