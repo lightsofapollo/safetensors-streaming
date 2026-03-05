@@ -15,6 +15,7 @@ from safetensors_streaming.safetensors_streaming import (  # type: ignore[import
     version,
 )
 from safetensors_streaming.patch import patch, patched, unpatch
+from safetensors_streaming.progress import tqdm_load_file, tqdm_stream_tensors
 
 __all__ = [
     # Native API
@@ -30,4 +31,7 @@ __all__ = [
     "patch",
     "unpatch",
     "patched",
+    # Progress-reporting wrappers
+    "tqdm_load_file",
+    "tqdm_stream_tensors",
 ]

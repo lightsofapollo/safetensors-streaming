@@ -6,6 +6,38 @@ use bytes::Bytes;
 use reqwest::Client;
 use std::time::Duration;
 
+/// Maximum number of retry attempts for transient HTTP errors.
+const MAX_RETRIES: u32 = 3;
+
+/// Base backoff duration for the first retry (doubles each attempt).
+const BASE_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Maximum jitter added to each backoff delay.
+const MAX_JITTER: Duration = Duration::from_millis(100);
+
+/// HTTP status codes that are eligible for retry.
+const RETRYABLE_STATUS_CODES: &[u16] = &[429, 500, 502, 503, 504];
+
+/// Compute the backoff duration for a given attempt (0-indexed).
+/// Formula: base * 2^attempt + deterministic jitter.
+/// Jitter is derived from (attempt + 1) * 37ms mod MAX_JITTER to avoid
+/// synchronized retry storms without requiring a random number generator.
+fn backoff_duration(attempt: u32) -> Duration {
+    let base = BASE_BACKOFF.saturating_mul(1 << attempt);
+    let jitter_ms = ((attempt as u64 + 1) * 37) % MAX_JITTER.as_millis() as u64;
+    base + Duration::from_millis(jitter_ms)
+}
+
+/// Returns true if a reqwest error is transient and should be retried.
+fn is_retryable_request_error(err: &reqwest::Error) -> bool {
+    err.is_connect() || err.is_timeout()
+}
+
+/// Returns true if an HTTP status code should be retried.
+fn is_retryable_status(status: u16) -> bool {
+    RETRYABLE_STATUS_CODES.contains(&status)
+}
+
 /// Parsed S3 URL components.
 #[derive(Debug, Clone)]
 pub struct S3Url {
@@ -246,7 +278,14 @@ impl RangeFetcher {
         }
     }
 
-    /// HTTP range fetch implementation.
+    /// HTTP range fetch implementation with retry logic for transient errors.
+    ///
+    /// Retries on:
+    /// - HTTP 429, 500, 502, 503, 504 status codes
+    /// - Connection errors (`reqwest::Error::is_connect()`)
+    /// - Timeout errors (`reqwest::Error::is_timeout()`)
+    ///
+    /// Uses exponential backoff with deterministic jitter.
     async fn fetch_range_http(
         client: &Client,
         url: &str,
@@ -254,30 +293,76 @@ impl RangeFetcher {
         end: u64,
     ) -> Result<Bytes, FetchError> {
         let range = format!("bytes={start}-{end}");
-        tracing::debug!(url, %range, "fetching byte range (HTTP)");
+        let mut last_error: Option<FetchError> = None;
 
-        let response = client
-            .get(url)
-            .header(reqwest::header::RANGE, &range)
-            .send()
-            .await
-            .map_err(FetchError::Request)?;
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                let delay = backoff_duration(attempt - 1);
+                tracing::warn!(
+                    url,
+                    attempt,
+                    delay_ms = delay.as_millis() as u64,
+                    "retrying HTTP range fetch after transient error"
+                );
+                tokio::time::sleep(delay).await;
+            }
 
-        let status = response.status();
+            tracing::debug!(url, %range, attempt, "fetching byte range (HTTP)");
 
-        if status.as_u16() == 206 {
-            return response.bytes().await.map_err(FetchError::Body);
+            let result = client
+                .get(url)
+                .header(reqwest::header::RANGE, &range)
+                .send()
+                .await;
+
+            let response = match result {
+                Ok(resp) => resp,
+                Err(err) => {
+                    if attempt < MAX_RETRIES && is_retryable_request_error(&err) {
+                        tracing::warn!(
+                            url,
+                            attempt,
+                            error = %err,
+                            "transient request error, will retry"
+                        );
+                        last_error = Some(FetchError::Request(err));
+                        continue;
+                    }
+                    return Err(FetchError::Request(err));
+                }
+            };
+
+            let status = response.status().as_u16();
+
+            if status == 206 {
+                return response.bytes().await.map_err(FetchError::Body);
+            }
+
+            if status == 200 {
+                // Server ignored Range header, returned full body. Slice it.
+                tracing::warn!("server returned 200 instead of 206, slicing response");
+                let full = response.bytes().await.map_err(FetchError::Body)?;
+                let end_idx = std::cmp::min((end + 1) as usize, full.len());
+                return Ok(full.slice(start as usize..end_idx));
+            }
+
+            if attempt < MAX_RETRIES && is_retryable_status(status) {
+                tracing::warn!(
+                    url,
+                    attempt,
+                    status,
+                    "retryable HTTP status, will retry"
+                );
+                last_error = Some(FetchError::UnexpectedStatus(status));
+                continue;
+            }
+
+            return Err(FetchError::UnexpectedStatus(status));
         }
 
-        if status.as_u16() == 200 {
-            // Server ignored Range header, returned full body. Slice it.
-            tracing::warn!("server returned 200 instead of 206, slicing response");
-            let full = response.bytes().await.map_err(FetchError::Body)?;
-            let end_idx = std::cmp::min((end + 1) as usize, full.len());
-            return Ok(full.slice(start as usize..end_idx));
-        }
-
-        Err(FetchError::UnexpectedStatus(status.as_u16()))
+        // All retries exhausted — return the last error.
+        // This path is only reachable if every attempt hit a retryable condition.
+        Err(last_error.unwrap_or(FetchError::UnexpectedStatus(0)))
     }
 
     /// S3 range fetch implementation.
@@ -435,6 +520,57 @@ mod tests {
         assert!(is_s3_url("s3://bucket/key"));
         assert!(!is_s3_url("https://example.com"));
         assert!(!is_s3_url("http://example.com"));
+    }
+
+    // ── Retry backoff calculation (no network) ─────────────────────────
+
+    #[test]
+    fn test_backoff_duration_increases_exponentially() {
+        let d0 = backoff_duration(0);
+        let d1 = backoff_duration(1);
+        let d2 = backoff_duration(2);
+
+        // Base durations: 100ms, 200ms, 400ms (plus jitter)
+        // Each should be roughly double the previous (within jitter bounds)
+        assert!(d0.as_millis() >= 100, "attempt 0 should be >= 100ms, got {}ms", d0.as_millis());
+        assert!(d0.as_millis() < 200, "attempt 0 should be < 200ms, got {}ms", d0.as_millis());
+
+        assert!(d1.as_millis() >= 200, "attempt 1 should be >= 200ms, got {}ms", d1.as_millis());
+        assert!(d1.as_millis() < 300, "attempt 1 should be < 300ms, got {}ms", d1.as_millis());
+
+        assert!(d2.as_millis() >= 400, "attempt 2 should be >= 400ms, got {}ms", d2.as_millis());
+        assert!(d2.as_millis() < 500, "attempt 2 should be < 500ms, got {}ms", d2.as_millis());
+    }
+
+    #[test]
+    fn test_backoff_includes_jitter() {
+        // Jitter = (attempt + 1) * 37 % 100, so:
+        // attempt 0: 1 * 37 % 100 = 37ms
+        // attempt 1: 2 * 37 % 100 = 74ms
+        // attempt 2: 3 * 37 % 100 = 11ms (wraps via modulo)
+        let d0 = backoff_duration(0);
+        let d1 = backoff_duration(1);
+        let d2 = backoff_duration(2);
+
+        assert_eq!(d0, Duration::from_millis(100 + 37));
+        assert_eq!(d1, Duration::from_millis(200 + 74));
+        assert_eq!(d2, Duration::from_millis(400 + 11));
+    }
+
+    #[test]
+    fn test_retryable_status_codes() {
+        assert!(is_retryable_status(429));
+        assert!(is_retryable_status(500));
+        assert!(is_retryable_status(502));
+        assert!(is_retryable_status(503));
+        assert!(is_retryable_status(504));
+        // Non-retryable
+        assert!(!is_retryable_status(400));
+        assert!(!is_retryable_status(401));
+        assert!(!is_retryable_status(403));
+        assert!(!is_retryable_status(404));
+        assert!(!is_retryable_status(200));
+        assert!(!is_retryable_status(206));
     }
 
     // ── HTTP tests (network required) ────────────────────────────────
