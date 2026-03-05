@@ -234,6 +234,9 @@ fn torch_dtype_attr(dtype: DType) -> &'static str {
 }
 
 /// Create a torch.Tensor from raw bytes, dtype, and shape.
+///
+/// Uses `torch.empty()` + direct memcpy for a single copy from Rust memory
+/// into the PyTorch tensor, avoiding the double-copy of `frombuffer` + `.clone()`.
 fn bytes_to_tensor(
     py: Python<'_>,
     data: &[u8],
@@ -243,16 +246,26 @@ fn bytes_to_tensor(
     let torch = py.import("torch")?;
     let dtype_obj = torch.getattr(torch_dtype_attr(dtype))?;
 
-    let data_bytes = PyByteArray::new(py, data);
+    let shape_tuple = PyTuple::new(py, shape.iter().map(|&s| s as i64))?;
     let kwargs = pyo3::types::PyDict::new(py);
     kwargs.set_item("dtype", dtype_obj)?;
-    let tensor = torch.call_method("frombuffer", (data_bytes,), Some(&kwargs))?;
 
-    let shape_tuple = PyTuple::new(py, shape.iter().map(|&s| s as i64))?;
-    let reshaped = tensor.call_method1("reshape", (shape_tuple,))?;
-    // Clone to own the data since frombuffer shares the buffer
-    let owned = reshaped.call_method0("clone")?;
-    Ok(owned.into_pyobject(py)?.into())
+    // Allocate tensor, then copy data directly into its storage
+    let tensor = torch.call_method("empty", (shape_tuple,), Some(&kwargs))?;
+    let data_ptr: usize = tensor.call_method0("data_ptr")?.extract()?;
+    let numel: usize = tensor.call_method0("numel")?.extract()?;
+    let element_size: usize = tensor.call_method0("element_size")?.extract()?;
+    let total_bytes = numel * element_size;
+
+    if total_bytes > 0 && total_bytes <= data.len() {
+        // SAFETY: data_ptr is a valid pointer to tensor storage of exactly total_bytes.
+        // We have exclusive access because the tensor was just created and not yet shared.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr as *mut u8, total_bytes);
+        }
+    }
+
+    Ok(tensor.into_pyobject(py)?.into())
 }
 
 #[pymethods]
@@ -372,32 +385,46 @@ fn load_file(py: Python<'_>, path_or_url: &str, device: &str) -> Result<PyObject
 }
 
 /// Load all tensors from a URL using StreamingPipeline.
+///
+/// Converts each tensor to a PyTorch tensor as it arrives, overlapping
+/// download (curl thread) with conversion (main thread). This halves peak
+/// memory usage and hides conversion latency behind download time.
 fn load_file_url(
     py: Python<'_>,
     url: &str,
     device: &DeviceSpec,
 ) -> Result<PyObject, SstPythonError> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    // Multi-thread runtime: worker threads drive the pipeline and bridge tasks
+    // concurrently with the main thread's tensor conversion.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .map_err(SstPythonError::Io)?;
 
-    let chunks: Vec<TensorChunk> = runtime.block_on(async {
+    // Initialize pipeline and start streaming
+    let mut consumer = runtime.block_on(async {
         let pipeline = StreamingPipeline::from_url(url, PipelineConfig::default()).await?;
-        let mut consumer = pipeline.stream();
-        let mut result = Vec::new();
-        while let Some(chunk) = consumer.recv().await {
-            result.push(chunk);
-        }
-        Ok::<_, SstPythonError>(result)
+        Ok::<_, SstPythonError>(pipeline.stream())
     })?;
 
     let dict = pyo3::types::PyDict::new(py);
-    for chunk in &chunks {
-        let cpu_tensor = bytes_to_tensor(py, &chunk.data, chunk.dtype, &chunk.shape)?;
-        let tensor = tensor_to_device(py, cpu_tensor, device)?;
-        dict.set_item(&chunk.name, tensor)?;
+
+    // Convert each tensor as it arrives — download and conversion overlap
+    // because curl runs on a blocking thread, the bridge on a worker thread,
+    // and conversion on the main thread.
+    loop {
+        let chunk = runtime.block_on(consumer.recv());
+        match chunk {
+            Some(c) => {
+                let cpu_tensor = bytes_to_tensor(py, &c.data, c.dtype, &c.shape)?;
+                let tensor = tensor_to_device(py, cpu_tensor, device)?;
+                dict.set_item(&c.name, tensor)?;
+            }
+            None => break,
+        }
     }
+
     Ok(dict.into_pyobject(py)?.into())
 }
 

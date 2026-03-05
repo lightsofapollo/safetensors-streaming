@@ -33,6 +33,7 @@ sha2 = "0.10"
 dirs = "6"
 sst-cache = { path = "sst-cache" }
 futures = "0.3"
+curl = "0.4"
 tokio-stream = "0.1"
 aws-sdk-s3 = "1.125"
 aws-config = "1.8"

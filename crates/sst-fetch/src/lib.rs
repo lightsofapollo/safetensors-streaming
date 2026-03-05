@@ -366,8 +366,8 @@ impl RangeFetcher {
     /// Fetch a byte range (inclusive start and end). Returns the raw bytes.
     pub async fn fetch_range(&self, start: u64, end: u64) -> Result<Bytes, FetchError> {
         match &self.inner {
-            FetcherInner::Http { client, url, .. } => {
-                Self::fetch_range_http(client, url, start, end).await
+            FetcherInner::Http { url, .. } => {
+                Self::fetch_range_curl(url, start, end).await
             }
             #[cfg(feature = "s3")]
             FetcherInner::S3 {
@@ -470,6 +470,53 @@ impl RangeFetcher {
         // All retries exhausted — return the last error.
         // This path is only reachable if every attempt hit a retryable condition.
         Err(last_error.unwrap_or(FetchError::UnexpectedStatus(0)))
+    }
+
+    /// libcurl-based range fetch — uses the same engine as the `curl` CLI
+    /// for maximum download throughput.
+    async fn fetch_range_curl(
+        url: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Bytes, FetchError> {
+        let range = format!("{start}-{end}");
+        let url = url.to_string();
+
+        tracing::debug!(%range, "fetching byte range (libcurl)");
+
+        tokio::task::spawn_blocking(move || {
+            let mut easy = curl::easy::Easy::new();
+            easy.url(&url).map_err(|e| FetchError::Curl(e.to_string()))?;
+            easy.range(&range).map_err(|e| FetchError::Curl(e.to_string()))?;
+            easy.follow_location(true).map_err(|e| FetchError::Curl(e.to_string()))?;
+            // 512 KB receive buffer — default is too small for high-throughput transfers
+            easy.buffer_size(512 * 1024).map_err(|e| FetchError::Curl(e.to_string()))?;
+
+            let expected_len = (end - start + 1) as usize;
+            let mut data = Vec::with_capacity(expected_len);
+
+            {
+                let mut transfer = easy.transfer();
+                transfer.write_function(|chunk| {
+                    data.extend_from_slice(chunk);
+                    Ok(chunk.len())
+                }).map_err(|e| FetchError::Curl(e.to_string()))?;
+
+                transfer.perform()
+                    .map_err(|e| FetchError::Curl(e.to_string()))?;
+            }
+
+            let status = easy.response_code()
+                .map_err(|e| FetchError::Curl(e.to_string()))?;
+
+            if status != 206 && status != 200 {
+                return Err(FetchError::UnexpectedStatus(status as u16));
+            }
+
+            Ok(Bytes::from(data))
+        })
+        .await
+        .map_err(|e| FetchError::JoinError(e.to_string()))?
     }
 
     /// S3 range fetch implementation.

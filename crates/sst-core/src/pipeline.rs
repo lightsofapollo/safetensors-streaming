@@ -3,6 +3,7 @@ use crate::header::{parse_header_json, parse_header_size};
 use crate::types::Header;
 #[cfg(test)]
 use crate::types::TensorInfo;
+use bytes::BytesMut;
 use sst_buffer::{Consumer, Producer, TensorChunk};
 use sst_fetch::RangeFetcher;
 use std::sync::Arc;
@@ -85,8 +86,8 @@ impl StreamingPipeline {
 
         tokio::spawn(async move {
             let result = if fetcher.is_http() {
-                // Single streaming download — maximum throughput
-                fetch_all_tensors_streaming(&fetcher, &header, &producer).await
+                // Single curl connection — stream data and extract tensors as they arrive
+                curl_streaming_fetch(&fetcher, &header, &producer).await
             } else if batch_size_bytes == 0 {
                 fetch_all_tensors_unbatched(&fetcher, &header, &producer).await
             } else {
@@ -300,6 +301,210 @@ async fn fetch_all_tensors_streaming(
 
         producer.send(chunk).await?;
     }
+
+    Ok(())
+}
+
+/// Stream data via a single curl connection and extract tensors as they arrive.
+/// This avoids large memory allocations — we only buffer enough data to complete
+/// the current tensor. Uses sync channel for backpressure between the curl
+/// blocking thread and the async producer.
+async fn curl_streaming_fetch(
+    fetcher: &Arc<RangeFetcher>,
+    header: &Header,
+    producer: &Producer,
+) -> Result<(), CoreError> {
+    let url = fetcher.url();
+    let data_start = header.data_start as u64;
+    let total_size = fetcher.total_size();
+
+    // Pre-compute tensor boundaries (relative to data section start)
+    let tensor_info: Vec<(String, sst_types::DType, Vec<usize>, usize, usize)> = header
+        .tensors
+        .iter()
+        .map(|t| {
+            (
+                t.name.clone(),
+                t.dtype,
+                t.shape.clone(),
+                t.data_offsets.0,
+                t.data_offsets.1,
+            )
+        })
+        .collect();
+
+    let tensor_count = tensor_info.len();
+
+    tracing::info!(
+        tensors = tensor_count,
+        data_start,
+        total_size,
+        "curl streaming mode"
+    );
+
+    // Bounded sync channel — blocks the curl thread when consumer is slow
+    let (tx, rx) = std::sync::mpsc::sync_channel::<TensorChunk>(8);
+
+    let handle = tokio::task::spawn_blocking(move || -> Result<(), CoreError> {
+        let mut easy = curl::easy::Easy::new();
+        easy.url(&url)
+            .map_err(|e| CoreError::Fetch(sst_fetch::FetchError::Curl(e.to_string())))?;
+        let range = format!("{data_start}-{}", total_size - 1);
+        easy.range(&range)
+            .map_err(|e| CoreError::Fetch(sst_fetch::FetchError::Curl(e.to_string())))?;
+        easy.follow_location(true)
+            .map_err(|e| CoreError::Fetch(sst_fetch::FetchError::Curl(e.to_string())))?;
+        easy.buffer_size(512 * 1024)
+            .map_err(|e| CoreError::Fetch(sst_fetch::FetchError::Curl(e.to_string())))?;
+
+        // State shared with the write callback
+        let mut buffer = BytesMut::new();
+        let mut tensor_idx: usize = 0;
+        let mut bytes_received: usize = 0;
+
+        {
+            let tx = &tx;
+            let tensor_info = &tensor_info;
+            let buffer = &mut buffer;
+            let tensor_idx = &mut tensor_idx;
+            let bytes_received = &mut bytes_received;
+
+            let mut transfer = easy.transfer();
+            transfer
+                .write_function(|chunk| {
+                    buffer.extend_from_slice(chunk);
+                    *bytes_received += chunk.len();
+
+                    // Extract completed tensors
+                    while *tensor_idx < tensor_info.len() {
+                        let (ref name, dtype, ref shape, rel_start, rel_end) =
+                            tensor_info[*tensor_idx];
+                        let tensor_size = rel_end - rel_start;
+
+                        // Check if we have enough data for this tensor
+                        // rel_end is relative to data section start, bytes_received is how much
+                        // we've downloaded from data section start
+                        if *bytes_received < rel_end {
+                            break;
+                        }
+
+                        // Extract tensor data from buffer
+                        let data = if tensor_size == 0 {
+                            bytes::Bytes::new()
+                        } else {
+                            // The tensor starts at rel_start in the data section.
+                            // Our buffer starts at (bytes_received - buffer.len()) relative to data section.
+                            let buf_start =
+                                *bytes_received - buffer.len(); // offset of buffer[0] in data section
+                            let offset_in_buf = rel_start - buf_start;
+                            let data =
+                                bytes::Bytes::copy_from_slice(&buffer[offset_in_buf..offset_in_buf + tensor_size]);
+                            data
+                        };
+
+                        let chunk = TensorChunk {
+                            name: name.clone(),
+                            data,
+                            dtype,
+                            shape: shape.clone(),
+                        };
+
+                        // Send to async consumer — blocks if channel is full (backpressure)
+                        if tx.send(chunk).is_err() {
+                            // Consumer dropped — abort download
+                            return Err(curl::easy::WriteError::Pause);
+                        }
+
+                        *tensor_idx += 1;
+
+                        // Drain buffer up to the next tensor's start (or the end of current tensor)
+                        // to keep memory usage low
+                        if *tensor_idx < tensor_info.len() {
+                            let next_start = tensor_info[*tensor_idx].3;
+                            let buf_start = *bytes_received - buffer.len();
+                            if next_start > buf_start {
+                                let drain_to = next_start - buf_start;
+                                if drain_to <= buffer.len() {
+                                    let _ = buffer.split_to(drain_to);
+                                }
+                            }
+                        } else {
+                            // All tensors extracted, clear buffer
+                            buffer.clear();
+                        }
+                    }
+
+                    Ok(chunk.len())
+                })
+                .map_err(|e| {
+                    CoreError::Fetch(sst_fetch::FetchError::Curl(e.to_string()))
+                })?;
+
+            transfer.perform().map_err(|e| {
+                CoreError::Fetch(sst_fetch::FetchError::Curl(e.to_string()))
+            })?;
+        }
+
+        let status = easy
+            .response_code()
+            .map_err(|e| CoreError::Fetch(sst_fetch::FetchError::Curl(e.to_string())))?;
+
+        if status != 206 && status != 200 {
+            return Err(CoreError::Fetch(
+                sst_fetch::FetchError::UnexpectedStatus(status as u16),
+            ));
+        }
+
+        Ok(())
+    });
+
+    // Bridge: read from sync channel and forward to async producer
+    // This runs on the tokio runtime and awaits the producer.send()
+    loop {
+        // Use spawn_blocking to avoid blocking the async runtime while waiting on the channel
+        let chunk = {
+            let rx_ref = &rx;
+            match rx_ref.try_recv() {
+                Ok(chunk) => Some(chunk),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Yield to tokio, then retry
+                    tokio::task::yield_now().await;
+                    // Try again, but this time block briefly
+                    match rx.recv_timeout(std::time::Duration::from_millis(1)) {
+                        Ok(chunk) => Some(chunk),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            // Check if the curl thread is done
+                            if handle.is_finished() {
+                                match rx.try_recv() {
+                                    Ok(chunk) => Some(chunk),
+                                    Err(_) => None,
+                                }
+                            } else {
+                                continue;
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+            }
+        };
+
+        match chunk {
+            Some(chunk) => {
+                producer.send(chunk).await?;
+            }
+            None => {
+                // Channel closed — curl thread is done
+                break;
+            }
+        }
+    }
+
+    // Wait for the curl thread to finish and propagate errors
+    handle
+        .await
+        .map_err(|e| CoreError::JoinError(e.to_string()))??;
 
     Ok(())
 }

@@ -25,6 +25,12 @@ pub enum FetchError {
     #[error("invalid header value: {0}")]
     InvalidHeader(reqwest::header::ToStrError),
 
+    #[error("curl error: {0}")]
+    Curl(String),
+
+    #[error("task join error: {0}")]
+    JoinError(String),
+
     #[error("invalid S3 URL: {0}")]
     InvalidS3Url(String),
 
