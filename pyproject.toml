@@ -7,7 +7,7 @@ name = "safetensors-streaming"
 version = "0.1.1"
 description = "Stream safetensors files from HTTP/S3 directly to GPU memory"
 requires-python = ">=3.10"
-license = "MIT"
+license = { file = "LICENSE" }
 authors = [
     { name = "James Lal", email = "james@littlebearlabs.io" },
 ]

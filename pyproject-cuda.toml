@@ -7,7 +7,7 @@ name = "safetensors-streaming-cu12"
 version = "0.1.1"
 description = "CUDA 12 accelerated backend for safetensors-streaming"
 requires-python = ">=3.10"
-license = "MIT"
+license = { file = "LICENSE" }
 authors = [
     { name = "James Lal", email = "james@littlebearlabs.io" },
 ]

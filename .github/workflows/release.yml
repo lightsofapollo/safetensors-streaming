@@ -82,7 +82,10 @@ jobs:
       - name: Build CUDA wheel
         run: |
           . "$HOME/.cargo/env"
-          maturin build --release --out dist -m pyproject-cuda.toml
+          cp pyproject.toml pyproject-cpu.toml
+          cp pyproject-cuda.toml pyproject.toml
+          maturin build --release --out dist
+          cp pyproject-cpu.toml pyproject.toml
         env:
           CUDA_PATH: /usr/local/cuda
       - uses: actions/upload-artifact@v4
