@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Supported tensor data types in safetensors format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DType {
     Bool,
     U8,

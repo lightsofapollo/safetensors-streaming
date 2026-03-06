@@ -74,10 +74,19 @@ def patch() -> None:
     sf_mod.safe_open = _streaming_safe_open  # type: ignore[attr-defined]
 
     # --- safetensors.torch.load_file ---
+    # For URLs, use our streaming load_file. For local files, delegate to the
+    # native implementation — it uses mmap + zero-copy which is unbeatable.
     try:
         sf_torch_mod = _get_module("safetensors.torch")
         _originals["safetensors.torch.load_file"] = sf_torch_mod.load_file  # type: ignore[attr-defined]
-        sf_torch_mod.load_file = _streaming_load_file  # type: ignore[attr-defined]
+        _native_load_file = sf_torch_mod.load_file  # type: ignore[attr-defined]
+
+        def _hybrid_load_file(path_or_url: str, *, device: str = "cpu") -> dict:  # type: ignore[type-arg]
+            if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
+                return _streaming_load_file(path_or_url, device=device)  # type: ignore[no-any-return]
+            return _native_load_file(path_or_url, device=device)  # type: ignore[no-any-return]
+
+        sf_torch_mod.load_file = _hybrid_load_file  # type: ignore[attr-defined]
     except ImportError:
         # safetensors installed without torch extras — skip torch patching
         pass

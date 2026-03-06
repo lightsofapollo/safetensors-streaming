@@ -10,19 +10,15 @@
   "environment": {
     "base_image": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
     "system": {
-      "apt": [{ "name": "curl" }, { "name": "pkg-config" }, { "name": "libssl-dev" }]
+      "apt": [{ "name": "curl" }]
     },
     "shell": {
       "steps": [
-        // Install Rust toolchain (gpu-cli sets CARGO_HOME=/gpu-cli-workspaces/.cache/cargo)
-        { "run": "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable" },
-        // Install nextest (pre-built binary) and maturin (via pip, faster than cargo install)
-        { "run": "curl -LsSf https://get.nexte.st/latest/linux | tar zxf - --no-same-owner -C /gpu-cli-workspaces/.cache/cargo/bin" },
-        { "run": "pip install maturin" }
+        // Install prebuilt wheel (cross-compiled from macOS) — no Rust needed
+        { "run": "pip install dist/safetensors_streaming-0.1.0-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" },
+        // Install Python deps directly — skip pyproject.toml to avoid maturin rebuild
+        { "run": "pip install torch safetensors transformers huggingface_hub pytest vllm" }
       ]
-    },
-    "python": {
-      "requirements": "requirements-dev.txt"
     }
   },
   "keep_alive_minutes": 10,

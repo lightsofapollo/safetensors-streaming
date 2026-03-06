@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyByteArray, PyTuple};
+use pyo3::types::PyTuple;
 use serde::Deserialize;
 use sst_buffer::TensorChunk;
 use sst_core::header::{parse_header, parse_header_json, parse_header_size};
@@ -233,10 +233,23 @@ fn torch_dtype_attr(dtype: DType) -> &'static str {
     }
 }
 
+/// Element size in bytes for each DType.
+fn dtype_element_size(dtype: DType) -> usize {
+    match dtype {
+        DType::Bool | DType::U8 | DType::I8 => 1,
+        DType::F16 | DType::BF16 | DType::I16 => 2,
+        DType::F32 | DType::I32 => 4,
+        DType::F64 | DType::I64 => 8,
+    }
+}
+
 /// Create a torch.Tensor from raw bytes, dtype, and shape.
 ///
 /// Uses `torch.empty()` + direct memcpy for a single copy from Rust memory
 /// into the PyTorch tensor, avoiding the double-copy of `frombuffer` + `.clone()`.
+///
+/// Computes numel and element_size in Rust to minimize Python method calls
+/// (only `torch.empty` + `.data_ptr()` cross the boundary per tensor).
 fn bytes_to_tensor(
     py: Python<'_>,
     data: &[u8],
@@ -250,12 +263,14 @@ fn bytes_to_tensor(
     let kwargs = pyo3::types::PyDict::new(py);
     kwargs.set_item("dtype", dtype_obj)?;
 
+    // Compute total bytes in Rust — avoid .numel() and .element_size() Python calls
+    let numel: usize = shape.iter().product();
+    let element_size = dtype_element_size(dtype);
+    let total_bytes = numel * element_size;
+
     // Allocate tensor, then copy data directly into its storage
     let tensor = torch.call_method("empty", (shape_tuple,), Some(&kwargs))?;
     let data_ptr: usize = tensor.call_method0("data_ptr")?.extract()?;
-    let numel: usize = tensor.call_method0("numel")?.extract()?;
-    let element_size: usize = tensor.call_method0("element_size")?.extract()?;
-    let total_bytes = numel * element_size;
 
     if total_bytes > 0 && total_bytes <= data.len() {
         // SAFETY: data_ptr is a valid pointer to tensor storage of exactly total_bytes.
@@ -432,6 +447,10 @@ fn load_file_url(
 }
 
 /// Load all tensors from a local file.
+///
+/// Optimized for bulk loading: caches the `torch` module import and dtype objects
+/// to minimize Python overhead per tensor. Each tensor only needs `torch.empty()`
+/// + `.data_ptr()` Python calls.
 fn load_file_local(
     py: Python<'_>,
     path: &str,
@@ -441,13 +460,48 @@ fn load_file_local(
     let data = bytes::Bytes::from(file_bytes);
     let header = parse_header(&data)?;
 
+    // Cache torch import and dtype objects — avoids re-importing per tensor
+    let torch = py.import("torch")?;
+    let mut dtype_cache: HashMap<DType, PyObject> = HashMap::new();
+
     let dict = pyo3::types::PyDict::new(py);
     for tensor in &header.tensors {
         let (abs_start, abs_end) = tensor.absolute_offsets(header.data_start);
         let tensor_data = &data[abs_start..abs_end];
-        let cpu_tensor = bytes_to_tensor(py, tensor_data, tensor.dtype, &tensor.shape)?;
-        let t = tensor_to_device(py, cpu_tensor, device)?;
-        dict.set_item(&tensor.name, t)?;
+
+        // Use cached dtype object
+        let dtype_obj = match dtype_cache.get(&tensor.dtype) {
+            Some(obj) => obj.clone_ref(py),
+            None => {
+                let obj = torch.getattr(torch_dtype_attr(tensor.dtype))?.into_pyobject(py)?.unbind();
+                dtype_cache.insert(tensor.dtype, obj.clone_ref(py));
+                obj
+            }
+        };
+
+        let shape_tuple = PyTuple::new(py, tensor.shape.iter().map(|&s| s as i64))?;
+        let kwargs = pyo3::types::PyDict::new(py);
+        kwargs.set_item("dtype", &dtype_obj)?;
+
+        let numel: usize = tensor.shape.iter().product();
+        let element_size = dtype_element_size(tensor.dtype);
+        let total_bytes = numel * element_size;
+
+        let t = torch.call_method("empty", (shape_tuple,), Some(&kwargs))?;
+        let data_ptr: usize = t.call_method0("data_ptr")?.extract()?;
+
+        if total_bytes > 0 && total_bytes <= tensor_data.len() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    tensor_data.as_ptr(),
+                    data_ptr as *mut u8,
+                    total_bytes,
+                );
+            }
+        }
+
+        let final_tensor = tensor_to_device(py, t.into_pyobject(py)?.into(), device)?;
+        dict.set_item(&tensor.name, final_tensor)?;
     }
     Ok(dict.into_pyobject(py)?.into())
 }
