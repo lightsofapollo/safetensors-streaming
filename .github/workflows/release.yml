@@ -82,19 +82,12 @@ jobs:
       - name: Build CUDA wheel
         run: |
           . "$HOME/.cargo/env"
-          maturin build --release --out dist --features cuda
+          maturin build --release --out dist -m pyproject-cuda.toml
         env:
           CUDA_PATH: /usr/local/cuda
-      - name: Rename wheel for CUDA variant
-        run: |
-          cd dist
-          for f in safetensors_streaming-*.whl; do
-            new_name=$(echo "$f" | sed 's/safetensors_streaming/safetensors_streaming_cu12/')
-            mv "$f" "$new_name"
-          done
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-cuda-${{ matrix.cuda_short }}
+          name: cuda-wheels-${{ matrix.cuda_short }}
           path: dist
 
   publish:
@@ -125,7 +118,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: wheels-cuda-*
+          pattern: cuda-wheels-*
           path: dist
           merge-multiple: true
       - name: Publish CUDA wheels to PyPI

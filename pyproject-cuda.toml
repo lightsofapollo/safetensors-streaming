@@ -3,9 +3,9 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "safetensors-streaming"
+name = "safetensors-streaming-cu12"
 version = "0.1.1"
-description = "Stream safetensors files from HTTP/S3 directly to GPU memory"
+description = "CUDA 12 accelerated backend for safetensors-streaming"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [
@@ -20,15 +20,11 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
-[project.optional-dependencies]
-cuda = ["safetensors-streaming-cu12==0.1.1"]
-
 [project.urls]
 Repository = "https://github.com/lightsofapollo/safetensors-streaming"
-Issues = "https://github.com/lightsofapollo/safetensors-streaming/issues"
 
 [tool.maturin]
 manifest-path = "crates/sst-python/Cargo.toml"
-module-name = "safetensors_streaming.safetensors_streaming"
-python-source = "python"
-features = ["pyo3/extension-module"]
+module-name = "safetensors_streaming_cu12.safetensors_streaming"
+python-source = "python-cuda"
+features = ["pyo3/extension-module", "cuda"]
