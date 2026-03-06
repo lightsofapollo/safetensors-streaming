@@ -77,7 +77,3 @@ This is experimental software. Known limitations:
 ## License
 
 MIT
-
-## Credits
-
-Built by [lightsofapollo](https://github.com/lightsofapollo).
