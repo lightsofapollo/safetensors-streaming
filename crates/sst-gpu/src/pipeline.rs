@@ -15,7 +15,6 @@ use crate::pinned::PinnedBuffer;
 use crate::GpuError;
 
 /// A tensor whose data now lives in GPU device memory.
-#[derive(Debug)]
 pub struct GpuTensor {
     /// Tensor name from the safetensors file.
     pub name: String,
@@ -29,6 +28,18 @@ pub struct GpuTensor {
     pub shape: Vec<usize>,
     // Hold the device buffer alive so the allocation isn't freed.
     _device_buf: crate::copy::DeviceBuffer,
+}
+
+impl std::fmt::Debug for GpuTensor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuTensor")
+            .field("name", &self.name)
+            .field("device_ptr", &self.device_ptr)
+            .field("len", &self.len)
+            .field("dtype", &self.dtype)
+            .field("shape", &self.shape)
+            .finish()
+    }
 }
 
 /// Orchestrates the full streaming pipeline:

@@ -15,12 +15,13 @@ use crate::GpuError;
 /// (e.g. to hand to PyTorch via `from_blob`).
 pub struct DeviceBuffer {
     inner: CudaSlice<u8>,
+    stream: Arc<CudaStream>,
 }
 
 impl DeviceBuffer {
     /// Raw device pointer as `u64`, suitable for FFI / PyTorch interop.
     pub fn device_ptr(&self) -> u64 {
-        let (ptr, _sync) = self.inner.device_ptr();
+        let (ptr, _sync) = self.inner.device_ptr(&self.stream);
         ptr as u64
     }
 
@@ -93,7 +94,7 @@ impl GpuCopier {
                     reason: e.to_string(),
                 }
             })?;
-            return Ok(DeviceBuffer { inner: empty });
+            return Ok(DeviceBuffer { inner: empty, stream: Arc::clone(&self.stream) });
         }
 
         // Build a host slice from the raw pointer (no ownership taken).
@@ -111,7 +112,7 @@ impl GpuCopier {
             })?;
 
         tracing::trace!(bytes = len, "queued H2D copy");
-        Ok(DeviceBuffer { inner: device_buf })
+        Ok(DeviceBuffer { inner: device_buf, stream: Arc::clone(&self.stream) })
     }
 
     /// Block until all work on this copier's stream has completed.
