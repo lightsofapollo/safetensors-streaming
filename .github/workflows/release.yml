@@ -78,7 +78,7 @@ jobs:
       - name: Install maturin
         run: |
           . "$HOME/.cargo/env"
-          pip3 install maturin
+          pip3 install maturin[patchelf]
       - name: Build CUDA wheel
         run: |
           . "$HOME/.cargo/env"
