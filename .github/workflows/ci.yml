@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libssl-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Check formatting
+        run: cargo fmt --workspace --check
+        working-directory: crates
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+        working-directory: crates
+      - name: Tests
+        run: cargo test --workspace
+        working-directory: crates
+
+  python-build:
+    name: Python wheel build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          args: --release --out dist
+          manylinux: auto
+          before-script-linux: |
+            yum install -y libcurl-devel openssl-devel || true
+      - name: Install and test import
+        run: |
+          pip install dist/*.whl
+          python -c "import safetensors_streaming; print('OK')"

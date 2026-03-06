@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-sdist:
+    name: Build sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
+
+  build-wheels:
+    name: Build ${{ matrix.target }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: auto
+          before-script-linux: |
+            yum install -y libcurl-devel openssl-devel || apt-get update && apt-get install -y libcurl4-openssl-dev libssl-dev
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist
+
+  build-cuda-wheels:
+    name: Build CUDA ${{ matrix.cuda }} (linux-x86_64)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda: "12.6"
+            cuda_short: "cu126"
+    container:
+      image: nvidia/cuda:${{ matrix.cuda }}.0-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y curl libcurl4-openssl-dev libssl-dev pkg-config python3-dev python3-pip git
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - name: Install maturin
+        run: |
+          . "$HOME/.cargo/env"
+          pip3 install maturin
+      - name: Build CUDA wheel
+        run: |
+          . "$HOME/.cargo/env"
+          maturin build --release --out dist --features cuda
+        env:
+          CUDA_PATH: /usr/local/cuda
+      - name: Rename wheel for CUDA variant
+        run: |
+          cd dist
+          for f in safetensors_streaming-*.whl; do
+            new_name=$(echo "$f" | sed 's/safetensors_streaming/safetensors_streaming_cu12/')
+            mv "$f" "$new_name"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-cuda-${{ matrix.cuda_short }}
+          path: dist
+
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs: [build-sdist, build-wheels]
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+
+  publish-cuda:
+    name: Publish CUDA wheels to PyPI
+    runs-on: ubuntu-latest
+    needs: [build-cuda-wheels]
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-cuda-*
+          path: dist
+          merge-multiple: true
+      - name: Publish CUDA wheels to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
