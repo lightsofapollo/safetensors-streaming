@@ -1,5 +1,6 @@
 # Rust build artifacts (don't sync to GPU pod — compile on pod instead)
 crates/target/
+tools/*/target/
 
 # Python build artifacts
 __pycache__/

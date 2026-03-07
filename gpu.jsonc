@@ -8,7 +8,6 @@
   "min_vram": 24,
   "outputs": ["benches/results/", "test-results/"],
   "environment": {
-    "base_image": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
     "system": {
       "apt": [{ "name": "curl" }]
     },
@@ -17,7 +16,7 @@
         // Install prebuilt wheel (cross-compiled from macOS) — no Rust needed
         { "run": "pip install dist/safetensors_streaming-0.1.0-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" },
         // Install Python deps directly — skip pyproject.toml to avoid maturin rebuild
-        { "run": "pip install torch safetensors transformers huggingface_hub pytest vllm" }
+        { "run": "pip install torch safetensors transformers diffusers huggingface_hub accelerate pytest" }
       ]
     }
   },

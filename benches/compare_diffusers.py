@@ -13,20 +13,28 @@ models = {
     "sd-turbo": "stabilityai/sd-turbo",
     "sd-1.5": "stable-diffusion-v1-5/stable-diffusion-v1-5",
     "flux-schnell": "black-forest-labs/FLUX.1-schnell",
+    "flux-klein": "black-forest-labs/FLUX.2-klein-4B",
 }
 
-model_name = sys.argv[1] if len(sys.argv) > 1 else "sd-turbo"
+local_only = "--local" in sys.argv
+args = [a for a in sys.argv[1:] if a != "--local"]
+model_name = args[0] if args else "sd-turbo"
 model_id = models.get(model_name, model_name)
 print(f"=== Diffusers: {model_id} ===\n")
 
-from huggingface_hub import snapshot_download
+load_kwargs = dict(local_files_only=True) if local_only else {}
 
-# --- Phase 0: Pre-download ---
-print("0. Pre-downloading model to cache...")
-t0 = time.perf_counter()
-snapshot_download(model_id)
-t1 = time.perf_counter()
-print(f"   Cache ready ({t1 - t0:.1f}s)\n")
+if not local_only:
+    from huggingface_hub import snapshot_download
+
+    # --- Phase 0: Pre-download ---
+    print("0. Pre-downloading model to cache...")
+    t0 = time.perf_counter()
+    snapshot_download(model_id)
+    t1 = time.perf_counter()
+    print(f"   Cache ready ({t1 - t0:.1f}s)\n")
+else:
+    print("0. Skipping download (--local mode)\n")
 
 # --- Phase 1: Baseline load ---
 from diffusers import DiffusionPipeline
@@ -36,6 +44,7 @@ t0 = time.perf_counter()
 pipe = DiffusionPipeline.from_pretrained(
     model_id,
     torch_dtype=torch.float16,
+    **load_kwargs,
 )
 t1 = time.perf_counter()
 baseline_time = t1 - t0
@@ -80,6 +89,7 @@ t0 = time.perf_counter()
 pipe = DiffusionPipeline.from_pretrained(
     model_id,
     torch_dtype=torch.float16,
+    **load_kwargs,
 )
 t1 = time.perf_counter()
 patched_time = t1 - t0

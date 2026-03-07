@@ -41,6 +41,7 @@ All benchmarks run on an RTX 4090, loading from local cache (no network). Each t
 | transformers | Phi-3-mini-4k | 3.8B | 2.0s | 0.2s | **8.4x** |
 | transformers | Qwen2.5-7B | 7.6B | 2.2s | 0.3s | **7.1x** |
 | transformers | Qwen2.5-14B | 14.8B | 2.8s | 0.7s | **3.9x** |
+| diffusers | FLUX.2 Klein 4B | 8.0B | 29.3s | 7.6s | **3.86x** |
 | diffusers | SD-Turbo | 1.3B | 4.5s | 2.5s | **1.77x** |
 | sentence-transformers | bge-large-en | 335M | 1.33s | 1.03s | **1.29x** |
 | vLLM | Qwen2.5-7B | 7.6B | 13.2s | 11.0s | **1.21x** |
